@@ -1,0 +1,1523 @@
+---
+title: "Analysis of CPTAC PDAC Discovery Study tumor RNA-seq data"
+author: Paul J. Myers
+output:
+  html_document:
+    fig_width: 9
+    fig_height: 6
+    theme: spacelab
+    toc: yes
+  pdf_document: 
+    toc: yes
+    fig_width: 12
+    fig_height: 9
+Date of creation: "4/16/2022"
+R version: "4.1.2"
+---
+
+# Housekeeping Code
+We start by loading some of the desired libraries for this script. Additional packages will be loaded later for specific analyses to make their use clear.
+
+```{r Load packages, message=F, warning=F}
+### Load packages:
+library(tidyverse)
+library(magrittr)
+library(BiocManager)
+library(paletteer)
+library(RColorBrewer)
+library(cowplot)
+library(ggrepel)
+library(ggbeeswarm)
+library(ggstatsplot)
+library(Hmisc)
+library(NMF)
+library(clusterProfiler)
+library(ComplexHeatmap)
+library(tidyHeatmap)
+library(parallel)
+library(org.Hs.eg.db)
+library(msigdbr)
+library(GSVA)
+library(survival)
+library(survminer)
+
+library(scales)
+library(ggcharts)
+
+library(pls)
+library(plsVarSel)
+```
+
+```{r Print session info}
+sink("sessionInfo_CPTAC.txt")
+sessionInfo()
+sink()
+```
+
+```{r Clear workspace}
+### Clear R workspace:
+rm(list=ls())
+```
+
+```{r Check working directory}
+### Check that current working directory is correct and the desired one:
+cwd <- getwd()
+cwd
+```
+
+```{r Define ni operator}
+## Define 'not in' (ni) operator
+`%ni%` <- Negate(`%in%`)
+```
+
+This function can be used to generate a ggplot with a blank grid and black box surrounding the plot area.
+```{r Custom ggplot theme for plot background}
+theme_cust <- function(ticks=T, axis="y", box=T, lnsz=1, 
+                       grid=F, grid_major=F, grid_minor=F, 
+                       gridlnsz=0.5, gridlnsz_major=0.5, gridlnsz_minor=gridlnsz_major/2,
+                       grid_linetype="dashed", grid_color="grey80",
+                       xtickangle=0, hjust=NULL, vjust=NULL, fill=NA,
+                       legend.position="right", strip_color=NA, strip_background=NA){
+  theme_out <- theme(legend.position=legend.position, 
+                     strip.background=element_rect(colour=strip_color, fill=strip_background),
+                     )
+  
+  if (ticks == FALSE & axis == "y" ){
+    theme_out <- theme_out + theme(
+      axis.text.y = element_blank(), axis.ticks.y = element_blank(), # Make y axis ticks blank
+      axis.line.y = element_blank(),
+      axis.line.x = element_blank(),
+      panel.background = element_rect(size = lnsz, color = "black", fill = fill),
+      )
+  }
+  else if (ticks == FALSE & axis != "y"){
+    theme_out <- theme_out + theme(
+      axis.text.x = element_blank(), axis.ticks.x = element_blank(), # Make x axis ticks blank
+      axis.line.y = element_blank(),
+      axis.line.x = element_blank(),
+      panel.background = element_rect(size = lnsz, color = "black", fill = fill),
+      )
+  }
+  else {
+     theme_out <- theme_out + theme(
+       axis.line.y = element_blank(),
+       axis.line.x = element_blank(),
+       panel.background = element_rect(size = lnsz, color = "black", fill = fill),
+       axis.text.x = element_text(angle=xtickangle, hjust = hjust, vjust=vjust),
+       ) 
+  }
+  if (!box) {
+    theme_out <- theme_out + theme(panel.background = element_blank(),
+                                   axis.line.y = element_line(size = lnsz, color = "black"),
+                                   axis.line.x = element_line(size = lnsz, color = "black")
+                                   )
+  }
+  # Grid lines:
+  if ((grid_major & grid_minor) | grid){
+    theme_out <- theme_out + 
+      theme(panel.grid = element_line(color=grid_color,
+                                      size = gridlnsz,
+                                      linetype = grid_linetype)
+            )
+  } else if (grid_major & !grid_minor){
+    theme_out <- theme_out + 
+      theme(panel.grid.major = element_line(color=grid_color,
+                                      size = gridlnsz_major,
+                                      linetype = grid_linetype)
+            )
+  } else if (!grid_major & grid_minor){
+    theme_out <- theme_out + 
+      theme(panel.grid.minor = element_line(color=grid_color,
+                                      size = gridlnsz_minor,
+                                      linetype = grid_linetype)
+            )    
+  }
+  return(theme_out)
+}
+
+# Julia's Plots.jl default color order:
+julia_cols <- c("#009AFA","#E26E47","#3FA54E","#c270D2","#AD8F18","#01ABAE","#ED5F92","#C68324","#01A98C","#8F961E","#01A9CD","#9B7EE8","#618CF7","#F16072","#DC65B7","#6D9E33") %>% rep.int(4)
+```
+
+# Load CPTAC data
+The CPTAC PDAC Discovery data were downloaded from the [CPTAC PDAC Discovery Study Data Portal](https://cptac-data-portal.georgetown.edu/study-summary/S061) and its [associated paper by Cao et al](https://www.sciencedirect.com/science/article/pii/S0092867421009971).
+
+```{r Clinical/phenotype data, message=F, warning=F}
+## Tumor purity information (from Fig. 1 of Cao et al.):
+fn_purity <- "Cao et al/CPTAC_low_purity_tumors.txt"
+low_purity_tumors <- read_tsv(fn_purity, col_names=F) %>% pull(X1) %>% make.names()
+
+
+## Clinical/phenotype data:
+# fn_clin <- "CPTAC PDAC data/S061_CPTAC_PDA_Discovery_Cohort_Clinical_Data_r1_Feb2021.xlsx"
+# clin_data <- readxl::read_excel(fn_clin, sheet="Patient_Clinical_Attributes")
+# colnames(clin_data) <- colnames(clin_data) %>% make.names()
+# clin_data <- clin_data %>% mutate(case_id = make.names(case_id))
+fn_clin <- "Cao et al/Table_S1.xlsx"
+clin_data <- readxl::read_excel(fn_clin, sheet="Clinical_data")
+colnames(clin_data) <- colnames(clin_data) %>% make.names()
+clin_data <- clin_data %>% 
+  mutate(case_id = make.names(case_id), bmi=as.numeric(bmi)) %>% 
+  mutate(purity = "high",
+         purity = replace(purity, str_detect(case_id, paste(low_purity_tumors, collapse="|")), "low"))
+
+
+## Molecular phenotype data from Cao et al.:
+mp_data <- readxl::read_excel(fn_clin, sheet="Molecular_phenotype_data", na=) %>% 
+  mutate(case_id = make.names(case_id)) %>% 
+  mutate(purity = "high",
+         purity = replace(purity, str_detect(case_id, paste(low_purity_tumors, collapse="|")), "low"),
+         Collisson = case_when(Collisson=="NA" ~ "N/A", TRUE ~ str_to_sentence(Collisson)),
+         Moffitt = case_when(Moffitt=="NA" ~ "N/A", TRUE ~ str_to_sentence(Moffitt)),
+         Bailey = case_when(Bailey=="NA" ~ "N/A", Bailey=="ADEX" ~ "ADEX", TRUE ~ str_to_sentence(Bailey)),
+         )
+
+
+## Mass spec sample data:
+fn_splinfo <- "CPTAC PDAC data/S061_CPTAC_PDA_Discovery_Cohort_Specimens_r1_Feb2021.xlsx" # sample info
+adenosquamous_spls <- c("C3N-02768","C3L-01453","C3L-02606","C3L-02613","C3N-00514","C3N-02768") %>% make.names()
+splinfo <- readxl::read_excel(fn_splinfo) %>% 
+  dplyr::select(contains(all_of(c("ID","Tumor","Withdrawn")))) %>%
+  subset(Withdrawn %in% "no" & `Tumor/Normal` %in% "Tumor") %>%
+  dplyr::rename(case_id = `Case ID`) %>%
+  mutate(case_id=make.names(case_id)) %>% 
+  subset(case_id %in% clin_data$case_id) %>% 
+  na.omit() %>% 
+  mutate(purity = "high",
+         purity = replace(purity, str_detect(case_id, paste(low_purity_tumors, collapse="|")), "low"))
+colnames(splinfo) <- colnames(splinfo) %>% make.names()
+
+
+```
+
+Load the RNA-seq data and pull out just the samples that are definitively from PDAC tumors. Note: Pancreatic adenosquamous carcinoma is a subset of PDAC.
+
+
+
+# RNA-seq analyses
+```{r Load the RNA-seq data, message=F}
+## Load data:
+fn <- "CPTAC PDAC data/PDAC_LinkedOmics_Data/mRNA_RSEM_UQ_log2_Tumor.cct" # raw mass-spec data for all samples analyzed
+data1 <- read_tsv(fn)
+colnames(data1)[1] <- "gene"
+colnames(data1) <- make.names(colnames(data1))
+
+# data1 <- data1[rowSums(is.na(data1[,-1])) != ncol(data1[,-1]), ] # remove rows with all NAs
+data1.l <- data1 %>% pivot_longer(-gene, names_to="case_id", values_to="expr")
+
+
+## Patient/sample metadata for tumors with global proteomics data:
+spls <- data.frame(case_id = colnames(data1)[-1],
+                   spl = paste("SPL",1:length(colnames(data1)[-1]), sep="")) %>%
+  # mutate(case_id = match(aliquot_id, splinfo$Aliquot.ID) %>% splinfo$case_id[.]) %>% 
+  inner_join(splinfo, by="case_id", suffix=c("",".x")) %>% 
+  inner_join(clin_data, by="case_id", suffix=c("",".x")) %>% 
+  mutate(purity = "high",
+         purity = replace(purity, str_detect(case_id, paste(low_purity_tumors, collapse="|")), "low"))
+```
+
+
+## Gene signatures of interest
+Now we introduce the "HIF signature" -- a set of 44 HIF target genes that were described/used by [Li et al. (2014)](https://doi.org/10.1038/nature13557).
+
+```{r HIF signature}
+hif.sig <- c("IGFBP3", "EDN2", "PFKFB4", "FLT1", "TFR2", "BNIP3L", "TGFA","BNIP3","PGK1","EGLN1","LDHA","EGLN3","CP","TGFB3","PFKFB3",
+             "HK1","TFRC","EDN1","CDKN1A","CA9","ADM1","HMOX1","SERPINE1","LOX","NDRG1","CA12","PDK1","VEGFA","ERO1L","RORA","P4HA1","MXI1",
+             "SLC2A1","STC2","MIF","DDIT4","ENO1","CXCR4","PLOD1","P4HA2","GAPDH","PGAM1","TMEM45A","PIM1")
+
+```
+
+We will also look at the immune and stromal signatures that underpin the ESTIMATE algorithm and see how their enrichment compares to the enrichment of the pcEMT signature (as well as how much overlap there is between pcEMT and these signatures).
+```{r ESTIMATE immune and stromal signatures}
+fn_estimate_sigs <- "../ESTIMATE_immune_stromal_signatures.txt"
+est.sig <- read_tsv(fn_estimate_sigs)
+
+est_strom <- est.sig %>% filter(type=="Stromal") %>% pull(gene)
+est_imm <- est.sig %>% filter(type=="Immune") %>% pull(gene)
+
+est_sigs <- list(ESTIMATE_IMMUNE_SIGNATURE = est_strom,
+                 ESTIMATE_STROMAL_SIGNATURE = est_imm) # list for GSVA calculations
+
+```
+
+Next we load the pan-cancer EMT (pcEMT) signature from [Mak et al. (2016)](https://doi.org/10.1158/1078-0432.ccr-15-0876). This signature/gene set contains genes associated with the epithelial and mesenchymal cell states, as derived from a pan-cancer analysis of TCGA RNA-seq data in which four marker genes--CDH1 (E), CDH2 (M), VIM (M), and FN1 (M)-- were used as "seed" genes against which the highest correlated genes were identified across tumors and extracted as part of the signature. *In total, the signature consists of 77 genes, 52 of which are associated with the mesenchymal phenotype and 25 of which the epithelial phenotype*
+
+```{r pcEMT signature, warning=F, message=F}
+## Load pan-cancer EMT signature:
+pcemt.fn <- "Pan-cancer-EMT-signature_Mak-et-al-2016.txt"
+pcemt.sig <- read_tsv(pcemt.fn, col_names = c("gene","type"))
+pcemt.sig.m <- read_tsv(pcemt.fn, col_names = c("gene","type")) %>% subset(type %in% "M")
+
+## Get pcEMT signature data:
+pcemt <- data1 %>% filter(gene %in% pcemt.sig$gene) %>% dplyr::select(-gene) %>% data.matrix()
+rownames(pcemt) <- data1$gene %in% pcemt.sig$gene %>% data1$gene[.]
+pcemt <- pcemt %>% na.omit()
+
+pcemt.t <- pcemt %>% t() %>% 
+  data.frame() %>% 
+  mutate(spl = rownames(.))
+
+## Expression for the mesenchymal genes:
+pcemt_m <- pcemt %>%
+  subset(rownames(.) %in% pcemt.sig.m$gene) %>%
+  t() 
+
+## Expression for the epithelial genes:
+pcemt_e <- pcemt %>%
+  subset(rownames(.) %ni% pcemt.sig.m$gene) %>%
+  t() 
+
+```
+```{r Collisson PDAssigner signature, message=F}
+## Load subtypes gene list:
+fn.sub <- "pdassigner_genes.csv"
+pda_genes <- read_csv(fn.sub)
+subtype_anno <- pda_genes[,-1] %>% data.frame()
+rownames(subtype_anno) <- pda_genes$gene
+
+pda_class <- pda_genes %>% filter(type=="classical") %>% dplyr::pull(gene)
+pda_exo <- pda_genes %>% filter(type=="exocrine_like") %>% dplyr::pull(gene)
+pda_qm <- pda_genes %>% filter(type=="QM") %>% dplyr::pull(gene)
+pda_sigs <- list(COLLISSON_CLASSICAL = pda_class,
+                 COLLISSON_EXOCRINE = pda_exo,
+                 COLLISSON_QUASIMESENCHYMAL = pda_qm)
+```
+
+```{r PDAC signatures, message=F}
+## =============== Load the signatures =============== ##\
+# -- Collisson:
+fn.coll <- "pdassigner_genes.csv"
+coll.sig <- read_csv(fn.coll) %>% 
+  mutate(sig = paste0("Collisson ",type))
+coll_anno <- coll.sig[,-1] %>% data.frame() 
+rownames(coll_anno) <- coll.sig$gene
+
+# -- Moffitt:
+fn.mof <- "Moffitt_PDAC_signature.txt" # PDAC subtype signature
+fn.mof_strom <- "Moffitt_stromal_signature.txt" # stromal signature
+mof.sig <- read_tsv(fn.mof) %>% 
+  mutate(sig = paste0("Moffitt ",type))
+mof_strom.sig <- read_tsv(fn.mof_strom) # Moffitt stromal signature
+
+# -- Bailey:
+# fn.bail <- "Bailey_PDAC_signature.txt"
+# bail.sig <- read_tsv(fn.bail) %>% 
+#   mutate(sig = paste0("Bailey ",type))
+
+fn.bail <- "BaileySubtypeSig.csv"
+bail.sig <- read_csv(fn.bail) %>% 
+  mutate(
+    gene = Symbol,
+    type = "Bailey",
+    sig = "Bailey"
+    ) %>% 
+  dplyr::select(gene, type, sig)
+
+# -- Combine them:
+pdac.sigs <- rbind(coll.sig, mof.sig, bail.sig)
+```
+
+
+## GSVA
+Here we load the necessary packages and gene sets from/related to the Molecular Signatures Database (MSigDB) for analyzing pathway and gene set enrichment in downstream analyses. The primary package we'll use for this is Gene Set Variation Analysis (`GSVA`), and we will load gene sets from the MSigDB programmatically using the `msigdbr` package.
+```{r Load MSigDB collections, message=F, warning=F}
+### Define MSigDB gene set collection(s) to use --> retrieve with 'msigdbr' package:
+species = "Homo sapiens"
+
+## Retrieve Hallmark and canonical pathways collections in the database:
+hall = msigdbr(species = species, category = "H")
+cp = msigdbr(species = species, category = "C2", subcategory = "CP")
+cp.b = msigdbr(species = species, category = "C2", subcategory = "CP:BIOCARTA")
+cp.r = msigdbr(species = species, category = "C2", subcategory = "CP:REACTOME")
+cp.p = msigdbr(species = species, category = "C2", subcategory = "CP:PID")
+cp.k = msigdbr(species = species, category = "C2", subcategory = "CP:KEGG")
+cp.w = msigdbr(species = species, category = "C2", subcategory = "CP:WIKIPATHWAYS")
+gene_sets1 <- rbind(hall, cp, cp.b, cp.r, cp.p, cp.k, cp.w) %>% split(x = .$gene_symbol, f = .$gs_name)
+
+## Go collections:
+go.bp <- msigdbr(species = species, category = "C5", subcategory = "GO:BP")
+go.cc <- msigdbr(species = species, category = "C5", subcategory = "GO:CC")
+go.mf <- msigdbr(species = species, category = "C5", subcategory = "GO:MF")
+gene_sets2 <- rbind(go.bp, go.cc, go.mf) %>% split(x = .$gene_symbol, f = .$gs_name)
+
+## Transcription factor target collections:
+go.tft <- msigdbr(species = species, category = "C3", subcategory = "TFT:GTRD")
+go.tft_leg <- msigdbr(species = species, category = "C3", subcategory = "TFT:TFT_Legacy")
+gene_sets3 <- rbind(go.tft, go.tft_leg) %>% split(x = .$gene_symbol, f = .$gs_name)
+
+## Pan-cancer EMT sub-signatures and HIF signature:
+pcemt_e.sig <- pcemt.sig %>% subset(type=="E") %>% dplyr::pull(gene)
+pcemt_m.sig <- pcemt.sig %>% subset(type=="M") %>% dplyr::pull(gene)
+
+gene_sets4 <- list(PCEMT_EPITHELIAL = pcemt_e.sig,
+                   PCEMT_MESENCHYMAL = pcemt_m.sig,
+                   HIF_SIGNATURE = hif.sig
+                   ) %>% append(est_sigs)
+
+gene_sets_all <- append(gene_sets1, gene_sets2) %>% append(gene_sets3) %>% append(gene_sets4)
+
+hallhypoxia <- data1 %>% subset(rownames(.) %in% gene_sets1$HALLMARK_HYPOXIA)
+```
+
+
+And now calculating GSVA scores for the desired gene sets.
+```{r GSVA calculations}
+#### Expression data prep ####
+### Format data: Samples as columns, genes as rows
+data_for_gsva <- data1[,-1] %>% data.matrix()
+rownames(data_for_gsva) <- data1$gene
+
+# ## Convert gene names to Entrez IDs:
+# entrez_ids <- rownames(data_for_gsva) %>% mapIds(org.Hs.eg.db, ., 'ENTREZID', 'SYMBOL')
+
+# rownames(data_for_gsva) <- entrez_ids
+  
+#### Calculate GSVA scores ####
+fn_gsva <- "CPTAC_gsva_results_RNAseq.Rdata" # file name for storing the GSVA results
+force_calculate_gsva <- F
+if(!file.exists(fn_gsva) | force_calculate_gsva){
+  gsva_res <- gsva(
+    data_for_gsva, 
+    # gene_sets_all,
+    gene_sets_all %>% subset(str_detect(names(.),paste("HALLMARK_|KEGG_",paste(names(gene_sets4),collapse="|"),sep="|"))),
+    method = "gsva", 
+    kcdf = "Gaussian",
+    min.sz = 5, # Minimum number of genes required to include a gene set
+    parallel.sz=detectCores()#-1
+    )
+  ### Save GSVA results:
+  save(list = c("gsva_res"), file = fn_gsva)
+  
+} else if (file.exists(fn_gsva) & !exists("gsva_res")){ 
+  ## Load GSVA results, if they haven't been loaded already:
+  load(fn_gsva) 
+}
+## GSVA results in dataframe format:
+gsva_res.df <- gsva_res %>% data.frame(gene.set=rownames(.), .) # Convert to data frame
+rownames(gsva_res.df) <- gsva_res.df$gene.set
+gsva_res.df.t <- gsva_res %>%
+  t() %>% 
+  data.frame(ID=rownames(.), .)
+```
+
+```{r Plot GSVA distributions}
+gsva_res.df.t %>% 
+  dplyr::select(ID, contains(all_of(c("PCEMT_","HALLMARK_HYPOXIA","HIF_SIG","HALLMARK_EPITHE")))) %>% 
+  pivot_longer(-ID) %>% 
+  ggplot(aes(x=value)) +
+    geom_histogram(aes(y=..density.., fill=name),
+                   color="black") +
+    geom_density() + 
+    facet_wrap(~name, scales="free_y") +
+    scale_fill_manual(values=julia_cols) +
+    theme_cowplot(8, rel_small=1, rel_large=1) +
+    guides(fill="none")
+  
+```
+
+
+Finally, we update the sample information/annotations/metadata with GSVA scores for certain gene sets that we are interested in.
+```{r Update sample annotations with GSVA scores}
+genesets_to_add <- c(
+                     names(gene_sets4),
+                     "ESTIMATE_IMMUNE_SIGNATURE",
+                     "ESTIMATE_STROMAL_SIGNATURE",
+                     "HALLMARK_EPITHELIAL_MESENCHYMAL_TRANSITION",
+                     "HALLMARK_HYPOXIA",
+                     "PCEMT_EPITHELIAL",
+                     "PCEMT_MESENCHYMAL",
+                     "HIF_SIGNATURE"
+                     ) %>% unique()
+matched_genesets <- genesets_to_add %>% match(rownames(gsva_res)) %>% rownames(gsva_res)[.] %>% na.omit()
+
+# spls <- data.frame(spls, t(gsva_res)[,genesets_to_add]) 
+# spls <- spls %>% inner_join(t(gsva_res)[,matched_genesets] %>% data.frame(Aliquot.ID=rownames(.)),
+#                             by="Aliquot.ID",
+spls <- spls %>% inner_join(t(gsva_res)[,matched_genesets] %>% data.frame(case_id=rownames(.)),
+                            by="case_id",
+                            suffix=c("",".x")
+                            ) 
+```
+
+
+## NMF clustering
+```{r NMF calculations}
+## =============== Perform NMF calculations using pcEMT signature =============== ##
+fn_nmfres <- "cptac_nmf_results_RNAseq.Rdata" # file path for storing NMF results
+nmf_method <- "brunet" # NMF algorithm to use
+nmf_opts <- "vp8" # verbosity/parallel options
+perform_nmf <- F # Choose whether to run NMF regardless of whether it has been done already or not
+if(!file.exists(fn_nmfres) | perform_nmf){
+  ## pcEMT NMF:
+  nmf_pcemt <- nmf(pcemt, rank=2:10, method=nmf_method, nrun=100, .opt=nmf_opts, seed=123) # check for optimal cluster number
+  nmf_pcemt2 <- nmf(pcemt, rank=2, method=nmf_method, nrun=500, .opt=nmf_opts, seed=123) # pcEMT, 2 clusters
+  
+  ## Save NMF results for speed:
+  nmfres_names <- c("nmf_pcemt","nmf_pcemt2")
+  save(list = nmfres_names, file = fn_nmfres)
+
+} else if(file.exists(fn_nmfres) & !exists("nmf_pcemt")){ 
+  ## Load NMF results, if they haven't been loaded already:
+  load(fn_nmfres) 
+}
+```
+
+
+```{r Get optimal NMF clusters}
+## Assess NMF quality metrics to determine best k:
+plot_nmf_qc <- F
+if(plot_nmf_qc){
+  plot(nmf_pcemt)
+  consensusmap(nmf_pcemt)
+  barplot(cophenetic*dispersion*silhouette.consensus~rank, nmf_pcemt$measures, main="NMF optimal factorization rank")
+  
+  ## NMF results for best k:
+  basismap(nmf_pcemt2)
+  coefmap(nmf_pcemt2)
+  consensusmap(nmf_pcemt2)
+}
+
+
+## =============== Get pcEMT NMF clusters =============== ##
+## pcEMT, 2 clusters, from NMF mixture coefficients:
+nmf2_maxs <- coef(nmf_pcemt2) %>% apply(2, max)
+nmf2_coef <- coef(nmf_pcemt2) %>% t()
+for(i in 1:length(nmf2_maxs)){
+  nmf2_coef[i,] <- nmf2_coef[i,] == nmf2_maxs[i]
+}
+nmf2_df <- nmf2_coef %>% 
+  data.frame(case_id=rownames(.), .) %>% 
+  mutate(NMF = "",
+         NMF = replace(NMF, X1==1,"M-low"),
+         NMF = replace(NMF, X2==1,"M-high"),
+         )
+```
+
+
+```{r Heatmap of NMF results}
+## =============== Heatmaps w/ pcEMT signature and NMF clusters =============== ##
+## Get pcEMT data for heatmap:
+pcemt_phm2 <- pcemt %>% data.matrix() %>% t() %>% scale()
+pcemt_df2 <- pcemt_phm2 %>% 
+  data.frame(case_id=rownames(.)) %>% 
+  pivot_longer(-case_id, names_to = "gene", values_to = "Expression z-score") %>% 
+  inner_join(pcemt.sig, by="gene", suffix=c("",".x")) %>% 
+    mutate(type = replace(type, type=="M","Mesenchymal"),
+           type = replace(type, type=="E","Epithelial"),
+           ) %>% 
+  dplyr::rename(pcEMT_sig=type)
+
+## Format NMF results for heatmap and joining to sample annotations:
+nmf_cc_df <- nmf2_df %>%
+  dplyr::select(contains(all_of(c("case_id","NMF")))) %>% 
+  inner_join(pcemt_df2, by="case_id", suffix=c("",".x")) %>% 
+  mutate(NMF = factor(NMF, levels=c("M-high","M-low")))
+
+
+## Plot params and color limits/breaks:
+len_out <- 6
+breaks1 <- seq(-3,3,length.out=100)
+breaks2 <- seq(-3,3,length.out=len_out+1)
+colors1 <- paletteer_d("RColorBrewer::RdBu", 100, direction=-1, type="continuous")
+annotcols <- paletteer_d("RColorBrewer::Set1")[2:1]
+annotcols2 <- paletteer_d("RColorBrewer::Set1")[3:4]
+# coll_cols <- c("#8AA3CC","#DB9F47","#9957AE","#AFAEAC")
+coll_cols <- c(viridis_pal(option="plasma")(3),"#AFAEAC")
+# moff_cols <- c("#DB9F47","#BA2126","#AFAEAC")
+moff_cols <- c(viridis_pal(option="cividis")(2),"#AFAEAC")
+# bail_cols <- c("#5A6CBE","#629D33","#C23886","#A74E22","#AFAEAC")
+bail_cols <- c(viridis_pal(option="viridis")(4),"#AFAEAC")
+
+## pcEMT, clusters from NMF mixture coefficients:
+nmf_pcemt_hm <- nmf_cc_df %>%
+  inner_join(spls, by="case_id", suffix=c("",".x")) %>% 
+  inner_join(mp_data, by="case_id", suffix=c("",".x")) %>% 
+  mutate(
+    Collisson = factor(Collisson, levels=c("Classical","Exocrine-like","Quasimesenchymal","N/A")), 
+    Moffitt = factor(Moffitt, levels=c("Basal-like","Classical","N/A")), 
+    Bailey = factor(Bailey, levels=c("ADEX","Immunogenic","Pancreatic progenitor","Squamous","N/A")), 
+  ) %>% 
+  dplyr::select(-ends_with(".x")) %>% 
+  group_by(pcEMT_sig, NMF) %>% 
+  heatmap(.row=case_id, .col=gene, .value=`Expression z-score`,
+          show_column_dend=F, show_row_dend=F, show_row_names=F, .scale="none",
+          cluster_columns=T, clustering_distance_columns="euclidean", clustering_method_columns="ward.D2",
+          cluster_rows=T, clustering_distance_rows="euclidean", clustering_method_rows="ward.D2",
+          palette_value=circlize::colorRamp2(breaks1, colors1), # heatmap cell colors
+          # palette_grouping=list(annotcols2[2:1], annotcols), # row group colors
+          palette_grouping=list(annotcols2[2:1], annotcols), # row group colors
+          heatmap_legend_param=list(at = breaks2),
+          column_title="CPTAC PDAC: NMF-clustered pan-cancer EMT signature", 
+          column_title_gp=gpar(fontsize=8),
+          row_title=NULL,
+          column_names_gp=gpar(fontsize=8),
+          use_raster=T,
+          ) %>% 
+  add_tile(Collisson, palette=coll_cols[c(1,3,2,4)]) %>% 
+  add_tile(Moffitt, palette=moff_cols) %>% 
+  add_tile(Bailey, palette=bail_cols[c(3,4,1,5,2)])
+  # add_tile(purity) %>%
+  # add_tile(HALLMARK_HYPOXIA, palette=viridis::viridis(100))
+nmf_pcemt_hm
+
+# -- Save plot to PNG and PDF formats:
+h <- 4
+w <- 10.5
+nmf_pcemt_hm %>% save_pdf("Plots and images/NMF_pcEMT_sig_coef-clusters_clustergram_RNAseq.pdf", height=h, width=w)
+png("Plots and images/NMF_pcEMT_sig_coef-clusters_clustergram_RNAseq.png", height=h, width=w, units="in", res=500); nmf_pcemt_hm; dev.off()
+
+
+## Add NMF cluster annotations to sample annotations:
+spls <- spls %>%
+  mutate(NMF = match(case_id, nmf_cc_df$case_id) %>% nmf_cc_df$NMF[.],
+         NMF = factor(NMF, levels=c("M-low","M-high")),
+         )
+```
+
+```{r Overlap w/ proteomics pcEMT NMF clusters}
+if(file.exists("CPTAC_spl_info_pcEMT-NMF-prot.csv")){
+  spls_comp <- read_csv("CPTAC_spl_info_pcEMT-NMF-prot.csv") %>% 
+  dplyr::select(case_id, pcEMT_NMF_protein) %>% 
+  inner_join(spls, by="case_id") %>% 
+  dplyr::rename(
+    NMF_protein = pcEMT_NMF_protein,
+    NMF_RNA = NMF,
+  )
+
+  wc = 3.5
+  hc = 4.5
+  spls_comp %>%   
+    ggbarstats(NMF_RNA, NMF_protein, label="both", bf.message=F) +
+      scale_fill_manual(values=annotcols2[2:1])
+  ggsave("Plots and images/ggbarstats_pcEMT_comps_protein-RNA.png", width=wc, height = hc)
+  ggsave("Plots and images/ggbarstats_pcEMT_comps_protein-RNA.pdf", width=wc, height = hc)
+  
+  
+  ## Heatmap w/ pcEMT protein and mRNA expression:
+  # -- Load pcEMT protein data:
+  fn_imputed <- "CPTAC PDAC data/imputed_proteomics_gene_level_MD_abundance_tumor.csv"
+  pcemt_prot <- read.csv(fn_imputed, row.names=1) %>% 
+    subset(row.names(.) %in% pcemt.sig$gene) %>% 
+    data.matrix() %>% t() %>% scale() %>% 
+    data.frame(case_id=rownames(.)) %>%
+    pivot_longer(-case_id, names_to = "gene", values_to = "Expression z-score") %>% 
+    inner_join(pcemt.sig, by="gene", suffix=c("",".x")) %>% 
+      mutate(type = replace(type, type=="M","Mesenchymal"),
+             type = replace(type, type=="E","Epithelial"),
+             ) %>% 
+    dplyr::rename(pcEMT_sig=type) %>% 
+    mutate(gene = paste0(gene,"_prot"), molec_type="protein")
+  
+  # -- Merge protein expression with mRNA expression and plot heatmap:
+  hm_data <- pcemt_df2 %>% 
+    mutate(gene = paste0(gene,"_RNA"), molec_type="RNA") %>% 
+    rbind(pcemt_prot) %>% 
+    inner_join(spls_comp, by="case_id", suffix=c("",".x")) %>% 
+    inner_join(mp_data, by="case_id", suffix=c("",".x")) %>% 
+    mutate(
+      Collisson = factor(Collisson, levels=c("Classical","Exocrine-like","Quasimesenchymal","N/A")), 
+      Moffitt = factor(Moffitt, levels=c("Basal-like","Classical","N/A")), 
+      Bailey = factor(Bailey, levels=c("ADEX","Immunogenic","Pancreatic progenitor","Squamous","N/A")), 
+      pcEMT_sig = paste0(pcEMT_sig, "_", molec_type),
+      NMF_RNA = factor(NMF_RNA, levels=c("M-high","M-low")),
+    ) %>% 
+    dplyr::select(-ends_with(".x")) 
+  
+  pcemt_comp_hm1 <- hm_data %>%
+    group_by(pcEMT_sig, NMF_protein) %>%
+    heatmap(.row=case_id, .col=gene, .value=`Expression z-score`,
+            show_column_dend=F, show_row_dend=F, show_row_names=F, #.scale="none",
+            cluster_columns=F, clustering_distance_columns="euclidean", clustering_method_columns="ward.D2",
+            cluster_rows=T, clustering_distance_rows="euclidean", clustering_method_rows="ward.D2",
+            palette_value=circlize::colorRamp2(breaks1, colors1), # heatmap cell colors
+            # palette_grouping=list(annotcols2[2:1], annotcols), # row group colors
+            palette_grouping=list(annotcols2[2:1], annotcols), # row group colors
+            heatmap_legend_param=list(at = breaks2),
+            column_title="CPTAC PDAC: NMF-clustered pan-cancer EMT signature",
+            column_title_gp=gpar(fontsize=8),
+            row_title=NULL,
+            column_names_gp=gpar(fontsize=8),
+            use_raster=T,
+            ) %>%
+    # add_tile(Collisson, palette=coll_cols[c(1,3,2,4)]) %>%
+    # add_tile(Moffitt, palette=moff_cols) %>%
+    # add_tile(Bailey, palette=bail_cols[c(3,4,1,5,2)]) %>%
+    add_tile(NMF_RNA, palette=annotcols2)
+  h = 4
+  w = 15
+  save_pdf(pcemt_comp_hm1, "Plots and images/NMF_pcEMT-heatmap_protein-RNA-comp.pdf", height=h, width=w)
+  png("Plots and images/NMF_pcEMT-heatmap_protein-RNA-comp.png", height=h, width=w, units="in", res=500); pcemt_comp_hm1; dev.off()
+  pcemt_comp_hm1
+  
+  
+  # -- Heatmap with only mis-matched samples across protein/RNA clustering:
+  pcemt_comp_hm2 <- hm_data %>% 
+    filter(NMF_protein != NMF_RNA) %>% 
+    group_by(pcEMT_sig, NMF_protein) %>% 
+    heatmap(.row=case_id, .col=gene, .value=`Expression z-score`,
+            show_column_dend=F, show_row_dend=F, show_row_names=F, #.scale="column",
+            cluster_columns=F, clustering_distance_columns="euclidean", clustering_method_columns="ward.D2",
+            cluster_rows=T, clustering_distance_rows="euclidean", clustering_method_rows="ward.D2",
+            palette_value=circlize::colorRamp2(breaks1, colors1), # heatmap cell colors
+            # palette_grouping=list(annotcols2[2:1], annotcols), # row group colors
+            palette_grouping=list(annotcols2[2:1], annotcols), # row group colors
+            heatmap_legend_param=list(at = breaks2),
+            column_title="CPTAC PDAC: NMF-clustered pan-cancer EMT signature", 
+            column_title_gp=gpar(fontsize=8),
+            row_title=NULL,
+            column_names_gp=gpar(fontsize=8),
+            use_raster=T,
+            ) %>% 
+    add_tile(NMF_RNA, palette=annotcols2)
+    h = 3.5
+    w = 15
+    save_pdf(pcemt_comp_hm2, "Plots and images/NMF_pcEMT-heatmap_protein-RNA-comp_mismatches.pdf", height=h, width=w)
+    png("Plots and images/NMF_pcEMT-heatmap_protein-RNA-comp_mismatches.png", height=h, width=w, units="in", res=500); pcemt_comp_hm2; dev.off()
+    pcemt_comp_hm2
+
+}
+```
+
+
+## Hypoxia correlations and comparisons to pcEMT enrichment
+
+```{r Compare hypoxia signature enrichment between pcEMT consensus clusters, message=F, warning=F}
+lnsz <- 0.5
+w <- 3/1.5
+h <- 3.5/1.5
+ptalph <- 0.7
+ptsz <- 1
+bplotw <- 0.15
+viow <- 0.75
+ptszrng <- c(0.5,3)
+qrw <- 0.1
+
+## =============== Hallmark Hypoxia comparisons: Boxplot/t-test =============== ##
+spls %>% 
+  # filter(purity=="high") %>% 
+  # mutate(pcEMT_cc=factor(pcEMT_cc, levels=c("M-low","M-high"))) %>%
+# ggbetweenstats(x=pcEMT_cc, y=HALLMARK_HYPOXIA,
+ggbetweenstats(x=NMF, y=HALLMARK_HYPOXIA,
+               plot.type="box", type="np",
+               point.args=list(alpha=ptalph, size=2, shape=16, position = position_quasirandom(width=qrw)),
+               # point.args=list(alpha=ptalph, size=2, shape=16, position = position_beeswarm()),
+               mean.ci=F, notch=F, centrality.plotting = F, bf.message = F,
+               ggplot.component=geom_boxplot(size=lnsz, alpha=0, width=0.3),
+               ggtheme=theme_cowplot(8, rel_small=1, rel_large=1, line_size=lnsz),
+               ) +
+  scale_color_manual(values=annotcols2) +
+  labs(x="NMF cluster", y="Hallmark Hypoxia enrichment score", title="CPTAC PDAC") 
+ggsave("Plots and images/Mlow-vs-Mhigh_Hallmark-Hypoxia_ggbetweenstats_RNAseq.png", width = w, height = h)
+ggsave("Plots and images/Mlow-vs-Mhigh_Hallmark-Hypoxia_ggbetweenstats_RNAseq.pdf", width = w, height = h)
+
+# Non-ggstatsplot plot:
+spls %>% 
+  # mutate(pcEMT_cc=factor(pcEMT_cc, levels=c("M-low","M-high"))) %>%
+  # ggplot(aes(x=pcEMT_cc, y=HALLMARK_HYPOXIA, color=pcEMT_cc, fill=pcEMT_cc)) + 
+  ggplot(aes(x=NMF, y=HALLMARK_HYPOXIA, fill=NMF, size=PCEMT_MESENCHYMAL)) + 
+    geom_violin(width=viow, color="black") + 
+    geom_boxplot(color="black", fill="white", outlier.shape=NA, width=bplotw) +
+    # geom_quasirandom(size=ptsz, alpha=ptalph, shape=16, position=position_quasirandom(width=qrw)) +
+    scale_color_manual(values=annotcols2) + scale_fill_manual(values=annotcols2) +
+    theme_cowplot(8, rel_small=1, rel_large=1, line_size=lnsz) +
+    # theme_minimal_grid(12) + 
+    labs(title="CPTAC PDAC", x="NMF cluster", y="Hallmark Hypoxia enrichment score") +
+    guides(color="none", fill="none")
+ggsave("Plots and images/Mlow-vs-Mhigh_Hallmark-Hypoxia_violin_RNAseq.pdf", width = w*0.8, height = h)
+ggsave("Plots and images/Mlow-vs-Mhigh_Hallmark-Hypoxia_violin_RNAseq.png", width = w*0.8, height = h)
+
+
+## =============== HIF signature comparisons: Boxplot/t-test =============== ##
+spls %>% 
+  # filter(purity=="high") %>% 
+  # mutate(pcEMT_cc=factor(pcEMT_cc, levels=c("M-low","M-high"))) %>%
+# ggbetweenstats(x=pcEMT_cc, y=HIF_SIGNATURE,
+ggbetweenstats(x=NMF, y=HIF_SIGNATURE,
+               plot.type="box", type="np",
+               # point.args=list(alpha=ptalph, size=2, shape=16, position = position_quasirandom(width=qrw)),
+               point.args=list(alpha=ptalph, size=2, shape=16, position = position_quasirandom(width=qrw)),
+               mean.ci=F, notch=F, centrality.plotting = F, bf.message = F,
+               ggplot.component=geom_boxplot(size=lnsz, alpha=0, width=0.3),
+               ggtheme=theme_cowplot(8, rel_small=1, rel_large=1, line_size=lnsz),
+               ) +
+  scale_color_manual(values=annotcols2) +
+  labs(x="NMF cluster", y="HIF signature enrichment score", title="CPTAC PDAC") 
+ggsave("Plots and images/Mlow-vs-Mhigh_HIF-sig_ggbetweenstats_RNAseq.png", width = w, height = h)
+ggsave("Plots and images/Mlow-vs-Mhigh_HIF-sig_ggbetweenstats_RNAseq.pdf", width = w, height = h)
+
+
+# Non-ggstatsplot plot:
+spls %>% 
+  # mutate(pcEMT_cc=factor(pcEMT_cc, levels=c("M-low","M-high"))) %>%
+  # ggplot(aes(x=pcEMT_cc, y=HIF_SIGNATURE, color=pcEMT_cc, fill=pcEMT_cc)) + 
+  ggplot(aes(x=NMF, y=HIF_SIGNATURE, fill=NMF)) + 
+    geom_violin(width=viow, color="black") + 
+    geom_boxplot(color="black", fill="white", outlier.shape=NA, width=bplotw) +
+    # geom_quasirandom(size=ptsz, alpha=ptalph, shape=16, position=position_quasirandom(width=qrw)) +
+    scale_color_manual(values=annotcols2) + scale_fill_manual(values=annotcols2) +
+    theme_cowplot(8, rel_small=1, rel_large=1, line_size=lnsz) +
+    # theme_minimal_grid(12) + 
+    labs(title="CPTAC PDAC", x="NMF cluster", y="HIF signature enrichment score") +
+    guides(color="none", fill="none")
+ggsave("Plots and images/Mlow-vs-Mhigh_HIF-sig_violin_RNAseq.pdf", width = w*0.8, height = h)
+ggsave("Plots and images/Mlow-vs-Mhigh_HIF-sig_violin_RNAseq.png", width = w*0.8, height = h)
+
+
+
+## =============== Hypoxia pathway PROGENy score comparisons: Boxplot/t-test =============== ##
+spls %>% 
+  inner_join(mp_data, by="case_id", suffix=c("",".x")) %>% 
+  # mutate(pcEMT_cc=factor(pcEMT_cc, levels=c("M-low","M-high"))) %>%
+# ggbetweenstats(x=pcEMT_cc, y=Hypoxia_pathway,
+ggbetweenstats(x=NMF, y=Hypoxia_pathway,
+               plot.type="box", type="np",
+               point.args=list(alpha=ptalph, size=2, shape=16, position = position_quasirandom(width=qrw)),
+               mean.ci=F, notch=F, centrality.plotting = F, bf.message = F,
+               ggplot.component=geom_boxplot(size=lnsz, alpha=0, width=0.3),
+               ggtheme=theme_cowplot(10, line_size=lnsz),
+               ) +
+  scale_color_manual(values=annotcols2) +
+  labs(x="NMF cluster", y="Hypoxia pathway PROGENy score", title="CPTAC PDAC") 
+ggsave("Plots and images/Mlow-vs-Mhigh_Hypoxia-pathway_ggbetweenstats_RNAseq.png", width = w, height = h)
+ggsave("Plots and images/Mlow-vs-Mhigh_Hypoxia-pathway_ggbetweenstats_RNAseq.pdf", width = w, height = h)
+
+
+# Non-ggstatsplot plot:
+spls %>% 
+  inner_join(mp_data, by="case_id", suffix=c("",".x")) %>% 
+  # mutate(pcEMT_cc=factor(pcEMT_cc, levels=c("M-low","M-high"))) %>%
+  # ggplot(aes(x=pcEMT_cc, y=HIF_SIGNATURE, color=pcEMT_cc, fill=pcEMT_cc)) + 
+  ggplot(aes(x=NMF, y=Hypoxia_pathway, fill=NMF)) + 
+    geom_violin(width=viow, color="black") + 
+    geom_boxplot(color="black", fill="white", outlier.shape=NA, width=bplotw) +
+    # geom_quasirandom(size=ptsz, alpha=ptalph, shape=16, position=position_quasirandom(width=qrw)) +
+    scale_color_manual(values=annotcols2) + scale_fill_manual(values=annotcols2) +
+    theme_cowplot(8, rel_small=1, rel_large=1, line_size=lnsz) + 
+    labs(title="CPTAC PDAC", x="NMF cluster", y="Hypoxia pathway PROGENy score") +
+    guides(color="none", fill="none")
+ggsave("Plots and images/Mlow-vs-Mhigh_Hypoxia-pathway_violin_RNAseq.pdf", width = w*0.8, height = h)
+ggsave("Plots and images/Mlow-vs-Mhigh_Hypoxia-pathway_violin_RNAseq.png", width = w*0.8, height = h)
+
+```
+
+```{r PRCC against pcEMT GSVA scores, message=F, warning=F}
+w = 7.2/1.7
+h = 3.8/1.7
+lnsz = 0.6
+bw = 0.8
+
+## =============== Partial rank correlation coefficient calculations =============== ##
+## =============== Hallmark Hypoxia =============== ##
+spls %>% 
+  inner_join(mp_data, by="case_id", suffix=c("",".x")) %>% 
+  dplyr::select(contains(all_of(c("PCEMT_M","HALLMARK_HYP","histology_estimate")))) %>%
+  dplyr::select(-contains("necrosis")) %>% 
+  ggcorrmat(
+    type="np", p.adjust.method="BH",
+    partial=T, output = "dataframe",
+  ) %>% 
+  filter(parameter1 %>% str_detect("PCEMT_M") | parameter2 %>% str_detect("PCEMT_M")) %>%
+  transform(parameter2 = ifelse(parameter2 %>% str_detect("PCEMT_M"), parameter1, parameter2), # swap names if in wrong column
+            parameter1 = ifelse(parameter2 %>% str_detect("PCEMT_M"), parameter2, parameter1)) %>%
+  # filter(parameter1 %>% str_detect("HALLMARK_HYP") | parameter2 %>% str_detect("HALLMARK_HYP")) %>%
+  # transform(parameter2 = ifelse(parameter2 %>% str_detect("HALLMARK_HYP"), parameter1, parameter2), 
+  #           parameter1 = ifelse(parameter2 %>% str_detect("HALLMARK_HYP"), parameter2, parameter1)) %>% 
+  mutate(parameter2 = gsub("_"," ",parameter2),
+         parameter2 = str_to_sentence(parameter2)
+         ) %>% 
+  arrange(desc(estimate)) %>% mutate(parameter2=factor(parameter2, levels=rev(parameter2))) %>%
+  ggplot(aes(y=parameter2, x=estimate)) +
+    geom_col(color="black", fill="grey50", size=lnsz, width=bw) + 
+    geom_vline(xintercept=0, size = lnsz) +
+    geom_errorbarh(aes(xmin=conf.low, xmax=conf.high), size = lnsz, height = 0.2) +
+    scale_y_discrete(expand=expansion(mult=c(0.1,0.1))) +
+    theme_cowplot(8, rel_small=1, rel_large=1, line_size=lnsz) + theme_cust(lnsz=NULL) + 
+    guides(fill=F) +
+    labs(
+      title="CPTAC PDAC: Partial correlations\nwith pcEMT-M enrichment",
+      # title="CPTAC PDAC: Partial correlations\nwith Hallmark Hypoxia enrichment",
+      x="Partial rank correlation coefficient", y=""
+      )
+ggsave("Plots and images/Partial-corrs_pcEMT-M_Hallmark-Hypoxia_RNAseq.png", width=w, height=h)
+ggsave("Plots and images/Partial-corrs_pcEMT-M_Hallmark-Hypoxia_RNAseq.pdf", width=w, height=h)
+
+
+
+## =============== HIF signature =============== ##
+spls %>% 
+  inner_join(mp_data, by="case_id", suffix=c("",".x")) %>% 
+  dplyr::select(contains(all_of(c("PCEMT_M","HIF_","histology_estimate")))) %>%
+  dplyr::select(-contains("necrosis")) %>% 
+  ggcorrmat(
+    type="np", matrix.type="full", p.adjust.method="BH",
+    partial=T,
+    output = "dataframe",
+    colors = paletteer_c("ggthemes::Red-Blue Diverging", 3, direction=-1),
+  ) %>% 
+  filter(parameter1 %>% str_detect("PCEMT_M") | parameter2 %>% str_detect("PCEMT_M")) %>%
+  transform(parameter2 = ifelse(parameter2 %>% str_detect("PCEMT_M"), parameter1, parameter2), # swap names if in wrong column
+            parameter1 = ifelse(parameter2 %>% str_detect("PCEMT_M"), parameter2, parameter1)) %>%
+  # filter(parameter1 %>% str_detect("HIF_") | parameter2 %>% str_detect("HIF_")) %>%
+  # transform(parameter2 = ifelse(parameter2 %>% str_detect("HIF_"), parameter1, parameter2), 
+  #           parameter1 = ifelse(parameter2 %>% str_detect("HIF_"), parameter2, parameter1)) %>% 
+  mutate(parameter2 = gsub("_"," ",parameter2),
+         parameter2 = str_to_sentence(parameter2)
+         ) %>% 
+  arrange(desc(estimate)) %>% mutate(parameter2=factor(parameter2, levels=rev(parameter2))) %>%
+  ggplot(aes(y=parameter2, x=estimate, fill=estimate)) +
+    geom_col(color="black", fill="grey50", size=lnsz, width=bw) +
+    # geom_point(color="black", size=3) + 
+    geom_vline(xintercept=0, size=lnsz) +
+    geom_errorbarh(aes(xmin=conf.low, xmax=conf.high), size = lnsz, height = 0.2) +
+    scale_y_discrete(expand=expansion(mult=c(0.1,0.1))) +
+    theme_cowplot(8, rel_small=1, rel_large=1, line_size=lnsz) + theme_cust(lnsz=lnsz) + 
+    guides(fill=F) +
+    labs(
+      title="CPTAC PDAC: Partial correlations\nwith pcEMT-M enrichment",
+      # title="CPTAC PDAC: Partial correlations\nwith HIF signature enrichment",
+      x="Partial rank correlation coefficient", y=""
+      )
+ggsave("Plots and images/Partial-corrs_pcEMT-M_HIF_RNAseq.png", width=w, height=h)
+ggsave("Plots and images/Partial-corrs_pcEMT-M_HIF_RNAseq.pdf", width=w, height=h)
+
+
+
+## =============== Hypoxia pathway =============== ##
+spls %>% 
+  inner_join(mp_data, by="case_id", suffix=c("",".x")) %>% 
+  dplyr::select(contains(all_of(c("PCEMT_M","Hypoxia_pathway","histology_estimate")))) %>%
+  dplyr::select(-contains("necrosis")) %>% 
+  ggcorrmat(
+    type="np", p.adjust.method="BH",
+    partial=T, output = "dataframe",
+  ) %>% 
+  filter(parameter1 %>% str_detect("PCEMT_M") | parameter2 %>% str_detect("PCEMT_M")) %>%
+  transform(parameter2 = ifelse(parameter2 %>% str_detect("PCEMT_M"), parameter1, parameter2), # swap names if in wrong column
+            parameter1 = ifelse(parameter2 %>% str_detect("PCEMT_M"), parameter2, parameter1)) %>%
+  # filter(parameter1 %>% str_detect("HALLMARK_HYP") | parameter2 %>% str_detect("HALLMARK_HYP")) %>%
+  # transform(parameter2 = ifelse(parameter2 %>% str_detect("HALLMARK_HYP"), parameter1, parameter2), 
+  #           parameter1 = ifelse(parameter2 %>% str_detect("HALLMARK_HYP"), parameter2, parameter1)) %>% 
+  mutate(parameter2 = gsub("_"," ",parameter2),
+         parameter2 = str_to_sentence(parameter2)
+         ) %>% 
+  arrange(desc(estimate)) %>% mutate(parameter2=factor(parameter2, levels=rev(parameter2))) %>% 
+  ggplot(aes(y=parameter2, x=estimate)) +
+    geom_col(color="black", fill="grey50", size=lnsz, width=bw) + 
+    geom_vline(xintercept=0, size = lnsz) +
+    geom_errorbarh(aes(xmin=conf.low, xmax=conf.high), size = lnsz, height = 0.2) +
+    scale_y_discrete(expand=expansion(mult=c(0.1,0.1))) +
+    theme_cowplot(8, rel_small=1, rel_large=1, line_size=lnsz) + theme_cust(lnsz=lnsz) + 
+    guides(fill=F) +
+    labs(
+      title="CPTAC PDAC: Partial correlations\nwith pcEMT-M enrichment",
+      # title="CPTAC PDAC: Partial correlations\nwith Hallmark Hypoxia enrichment",
+      x="Partial rank correlation coefficient", y=""
+      )
+ggsave("Plots and images/Partial-corrs_pcEMT-M_Hypoxia-pathway_RNAseq.png", width=w, height=h)
+ggsave("Plots and images/Partial-corrs_pcEMT-M_Hypoxia-pathway_RNAseq.pdf", width=w, height=h)
+
+```
+
+
+```{r Collisson-Hypoxia comparisons}
+lnsz <- 0.5
+w <- 5.7/1.2
+h <- 3.5/1.5
+ptalph <- 0.7
+ptsz <- 2
+bplotw <- 0.15
+viow <- 0.75
+vioa <- 0.6
+ptszrng <- c(0.25,2)
+qrw <- 0.1
+fntsz <- 8
+
+## =============== Hallmark Hypoxia comparisons: Boxplot/t-test =============== ##
+spls %>% 
+  inner_join(mp_data, by="case_id", suffix=c("",".x")) %>% filter(Collisson != "N/A") %>% 
+  # filter(purity=="high") %>% 
+ggbetweenstats(x=Collisson, y=HALLMARK_HYPOXIA,
+               plot.type="box", type="np", p.adjust.method="BH",
+               point.args=list(alpha=ptalph, size=2, shape=16, position = position_quasirandom(width=qrw)),
+               # point.args=list(alpha=ptalph, size=2, shape=16, position = position_beeswarm()),
+               mean.ci=F, notch=F, centrality.plotting = F, bf.message = F,
+               ggplot.component=geom_boxplot(size=lnsz, alpha=0, width=0.3),
+               ggtheme=theme_cowplot(fntsz, rel_small=1, rel_large=1, line_size=lnsz),
+               ) +
+  scale_color_manual(values=coll_cols) +
+  labs(x="Collisson subtype", y="Hallmark Hypoxia enrichment score", title="CPTAC PDAC") 
+ggsave("Plots and images/Collisson_Hallmark-Hypoxia_ggbetweenstats_RNAseq.png", width = w, height = h)
+ggsave("Plots and images/Collisson_Hallmark-Hypoxia_ggbetweenstats_RNAseq.pdf", width = w, height = h)
+
+# Non-ggstatsplot plot:
+spls %>% 
+  inner_join(mp_data, by="case_id", suffix=c("",".x")) %>% filter(Collisson != "N/A") %>% 
+  # filter(purity=="high") %>% 
+  ggplot(aes(x=Collisson, y=HALLMARK_HYPOXIA, fill=Collisson)) + 
+    geom_violin(width=viow, alpha=vioa, color="black") + 
+    geom_boxplot(color="black", fill="white", outlier.shape=NA, width=bplotw) +
+    # geom_quasirandom(size=ptsz, alpha=ptalph, shape=16, position=position_quasirandom(width=qrw)) +
+    geom_quasirandom(aes(size=PCEMT_MESENCHYMAL), alpha=ptalph, shape=16, position=position_quasirandom(width=qrw)) +
+    scale_fill_manual(values=coll_cols) + scale_size_continuous(range=ptszrng) +
+    theme_cowplot(fntsz, rel_small=1, rel_large=1, line_size=lnsz) +
+    # theme_minimal_grid(12) + 
+    labs(title="CPTAC PDAC", x="Collisson subtype", y="Hallmark Hypoxia enrichment score") +
+    guides(color="none", fill="none")
+ggsave("Plots and images/Collisson_Hallmark-Hypoxia_comps_RNAseq.pdf", width = w*1.15, height = h)
+ggsave("Plots and images/Collisson_Hallmark-Hypoxia_comps_RNAseq.png", width = w*1.15, height = h)
+
+
+## =============== HIF signature comparisons: Boxplot/t-test =============== ##
+spls %>% 
+  inner_join(mp_data, by="case_id", suffix=c("",".x")) %>% filter(Collisson != "N/A") %>% 
+  # filter(purity=="high") %>% 
+ggbetweenstats(x=Collisson, y=HIF_SIGNATURE,
+               plot.type="box", type="np", p.adjust.method="BH",
+               # point.args=list(alpha=ptalph, size=2, shape=16, position = position_quasirandom(width=qrw)),
+               point.args=list(alpha=ptalph, size=2, shape=16, position = position_quasirandom(width=qrw)),
+               mean.ci=F, notch=F, centrality.plotting = F, bf.message = F,
+               ggplot.component=geom_boxplot(size=lnsz, alpha=0, width=0.3),
+               ggtheme=theme_cowplot(fntsz, rel_small=1, rel_large=1, line_size=lnsz),
+               ) +
+  scale_color_manual(values=coll_cols) +
+  labs(x="Collisson subtype", y="HIF signature enrichment score", title="CPTAC PDAC") 
+ggsave("Plots and images/Collisson_HIF-sig_ggbetweenstats_RNAseq.png", width = w, height = h)
+ggsave("Plots and images/Collisson_HIF-sig_ggbetweenstats_RNAseq.pdf", width = w, height = h)
+
+
+# Non-ggstatsplot plot:
+spls %>% 
+  inner_join(mp_data, by="case_id", suffix=c("",".x")) %>% filter(Collisson != "N/A") %>% 
+  # filter(purity=="high") %>% 
+  ggplot(aes(x=Collisson, y=HIF_SIGNATURE, fill=Collisson)) + 
+    geom_violin(width=viow, alpha=vioa, color="black") + 
+    geom_boxplot(color="black", fill="white", outlier.shape=NA, width=bplotw) +
+    # geom_quasirandom(size=ptsz, alpha=ptalph, shape=16, position=position_quasirandom(width=qrw)) +
+    geom_quasirandom(aes(size=PCEMT_MESENCHYMAL), alpha=ptalph, shape=16, position=position_quasirandom(width=qrw)) +
+    scale_fill_manual(values=coll_cols) + scale_size_continuous(range=ptszrng) +
+    theme_cowplot(fntsz, rel_small=1, rel_large=1, line_size=lnsz) +
+    # theme_minimal_grid(12) + 
+    labs(title="CPTAC PDAC", x="Collisson subtype", y="HIF signature enrichment score") +
+    guides(color="none", fill="none")
+ggsave("Plots and images/Collisson_HIF-sig_comps_RNAseq.pdf", width = w*1.15, height = h)
+ggsave("Plots and images/Collisson_HIF-sig_comps_RNAseq.png", width = w*1.15, height = h)
+
+
+
+## =============== Hypoxia pathway PROGENy score comparisons: Boxplot/t-test =============== ##
+spls %>% 
+  inner_join(mp_data, by="case_id", suffix=c("",".x")) %>% filter(Collisson != "N/A") %>% 
+  # filter(purity=="high") %>% 
+ggbetweenstats(x=Collisson, y=Hypoxia_pathway,
+               plot.type="box", type="np", p.adjust.method="BH",
+               point.args=list(alpha=ptalph, size=2, shape=16, position = position_quasirandom(width=qrw)),
+               mean.ci=F, notch=F, centrality.plotting = F, bf.message = F,
+               ggplot.component=geom_boxplot(size=lnsz, alpha=0, width=0.3),
+               ggtheme=theme_cowplot(fntsz, line_size=lnsz),
+               ) +
+  scale_color_manual(values=coll_cols) +
+  labs(x="Collisson subtype", y="Hypoxia pathway PROGENy score", title="CPTAC PDAC") 
+ggsave("Plots and images/Collisson_Hypoxia-pathway_ggbetweenstats_RNAseq.png", width = w, height = h)
+ggsave("Plots and images/Collisson_Hypoxia-pathway_ggbetweenstats_RNAseq.pdf", width = w, height = h)
+
+
+# Non-ggstatsplot plot:
+spls %>% 
+  inner_join(mp_data, by="case_id", suffix=c("",".x")) %>% filter(Collisson != "N/A") %>% 
+  # filter(purity=="high") %>% 
+  ggplot(aes(x=Collisson, y=Hypoxia_pathway, fill=Collisson)) + 
+    geom_violin(width=viow, alpha=vioa, color="black") + 
+    geom_boxplot(color="black", fill="white", outlier.shape=NA, width=bplotw) +
+    # geom_quasirandom(size=ptsz, alpha=ptalph, shape=16, position=position_quasirandom(width=qrw)) +
+    geom_quasirandom(aes(size=PCEMT_MESENCHYMAL), alpha=ptalph, shape=16, position=position_quasirandom(width=qrw)) +
+    scale_fill_manual(values=coll_cols) + scale_size_continuous(range=ptszrng) +
+    theme_cowplot(fntsz, rel_small=1, rel_large=1, line_size=lnsz) + 
+    labs(title="CPTAC PDAC", x="Collisson subtype", y="Hypoxia pathway PROGENy score") +
+    guides(color="none", fill="none")
+ggsave("Plots and images/Collisson_Hypoxia-pathway_comps_RNAseq.pdf", width = w*1.15, height = h)
+ggsave("Plots and images/Collisson_Hypoxia-pathway_comps_RNAseq.png", width = w*1.15, height = h)
+```
+
+
+```{r Moffitt-Hypoxia comparisons}
+lnsz <- 0.5
+w <- 4/1.5
+h <- 3.5/1.5
+ptalph <- 0.7
+ptsz <- 2
+bplotw <- 0.15
+viow <- 0.75
+vioa <- 0.5
+ptszrng <- c(0.25,2)
+qrw <- 0.1
+fntsz <- 8
+
+## =============== Hallmark Hypoxia comparisons: Boxplot/t-test =============== ##
+spls %>% 
+  inner_join(mp_data, by="case_id", suffix=c("",".x")) %>% filter(Moffitt != "N/A") %>% 
+  mutate(Moffitt = factor(Moffitt, levels=c("Classical","Basal-like","N/A")),) %>%
+  # filter(purity=="high") %>% 
+ggbetweenstats(x=Moffitt, y=HALLMARK_HYPOXIA,
+               plot.type="box", type="np", p.adjust.method="BH",
+               point.args=list(alpha=ptalph, size=2, shape=16, position = position_quasirandom(width=qrw)),
+               # point.args=list(alpha=ptalph, size=2, shape=16, position = position_beeswarm()),
+               mean.ci=F, notch=F, centrality.plotting = F, bf.message = F,
+               ggplot.component=geom_boxplot(size=lnsz, alpha=0, width=0.3),
+               ggtheme=theme_cowplot(fntsz, rel_small=1, rel_large=1, line_size=lnsz),
+               ) +
+  scale_color_manual(values=moff_cols) +
+  labs(x="Moffitt subtype", y="Hallmark Hypoxia enrichment score", title="CPTAC PDAC") 
+ggsave("Plots and images/Moffitt_Hallmark-Hypoxia_ggbetweenstats_RNAseq.png", width = w, height = h)
+ggsave("Plots and images/Moffitt_Hallmark-Hypoxia_ggbetweenstats_RNAseq.pdf", width = w, height = h)
+
+# Non-ggstatsplot plot:
+spls %>% 
+  inner_join(mp_data, by="case_id", suffix=c("",".x")) %>% filter(Moffitt != "N/A") %>% 
+  mutate(Moffitt = factor(Moffitt, levels=c("Classical","Basal-like","N/A")),) %>%
+  # filter(purity=="high") %>% 
+  ggplot(aes(x=Moffitt, y=HALLMARK_HYPOXIA, fill=Moffitt)) + 
+    geom_violin(width=viow, alpha=vioa, color="black") + 
+    geom_boxplot(color="black", fill="white", outlier.shape=NA, width=bplotw) +
+    # geom_quasirandom(size=ptsz, alpha=ptalph, shape=16, position=position_quasirandom(width=qrw)) +
+    geom_quasirandom(aes(size=PCEMT_MESENCHYMAL), alpha=ptalph, shape=16, position=position_quasirandom(width=qrw)) +
+    scale_fill_manual(values=moff_cols) + scale_size_continuous(range=ptszrng) +
+    theme_cowplot(fntsz, rel_small=1, rel_large=1, line_size=lnsz) +
+    # theme_minimal_grid(12) + 
+    labs(title="CPTAC PDAC", x="Moffitt subtype", y="Hallmark Hypoxia enrichment score") +
+    guides(color="none", fill="none")
+ggsave("Plots and images/Moffitt_Hallmark-Hypoxia_comps_RNAseq.pdf", width = w*1.15, height = h)
+ggsave("Plots and images/Moffitt_Hallmark-Hypoxia_comps_RNAseq.png", width = w*1.15, height = h)
+
+
+## =============== HIF signature comparisons: Boxplot/t-test =============== ##
+spls %>% 
+  inner_join(mp_data, by="case_id", suffix=c("",".x")) %>% filter(Moffitt != "N/A") %>% 
+  mutate(Moffitt = factor(Moffitt, levels=c("Classical","Basal-like","N/A")),) %>%
+  # filter(purity=="high") %>% 
+ggbetweenstats(x=Moffitt, y=HIF_SIGNATURE,
+               plot.type="box", type="np", p.adjust.method="BH",
+               # point.args=list(alpha=ptalph, size=2, shape=16, position = position_quasirandom(width=qrw)),
+               point.args=list(alpha=ptalph, size=2, shape=16, position = position_quasirandom(width=qrw)),
+               mean.ci=F, notch=F, centrality.plotting = F, bf.message = F,
+               ggplot.component=geom_boxplot(size=lnsz, alpha=0, width=0.3),
+               ggtheme=theme_cowplot(fntsz, rel_small=1, rel_large=1, line_size=lnsz),
+               ) +
+  scale_color_manual(values=moff_cols) +
+  labs(x="Moffitt subtype", y="HIF signature enrichment score", title="CPTAC PDAC") 
+ggsave("Plots and images/Moffitt_HIF-sig_ggbetweenstats_RNAseq.png", width = w, height = h)
+ggsave("Plots and images/Moffitt_HIF-sig_ggbetweenstats_RNAseq.pdf", width = w, height = h)
+
+
+# Non-ggstatsplot plot:
+spls %>% 
+  inner_join(mp_data, by="case_id", suffix=c("",".x")) %>% filter(Moffitt != "N/A") %>% 
+  mutate(Moffitt = factor(Moffitt, levels=c("Classical","Basal-like","N/A")),) %>%
+  # filter(purity=="high") %>% 
+  ggplot(aes(x=Moffitt, y=HIF_SIGNATURE, fill=Moffitt)) + 
+    geom_violin(width=viow, alpha=vioa, color="black") + 
+    geom_boxplot(color="black", fill="white", outlier.shape=NA, width=bplotw) +
+    # geom_quasirandom(size=ptsz, alpha=ptalph, shape=16, position=position_quasirandom(width=qrw)) +
+    geom_quasirandom(aes(size=PCEMT_MESENCHYMAL), alpha=ptalph, shape=16, position=position_quasirandom(width=qrw)) +
+    scale_fill_manual(values=moff_cols) + scale_size_continuous(range=ptszrng) +
+    theme_cowplot(fntsz, rel_small=1, rel_large=1, line_size=lnsz) +
+    # theme_minimal_grid(12) + 
+    labs(title="CPTAC PDAC", x="Moffitt subtype", y="HIF signature enrichment score") +
+    guides(color="none", fill="none")
+ggsave("Plots and images/Moffitt_HIF-sig_comps_RNAseq.pdf", width = w*1.15, height = h)
+ggsave("Plots and images/Moffitt_HIF-sig_comps_RNAseq.png", width = w*1.15, height = h)
+
+
+
+## =============== Hypoxia pathway PROGENy score comparisons: Boxplot/t-test =============== ##
+spls %>% 
+  inner_join(mp_data, by="case_id", suffix=c("",".x")) %>% filter(Moffitt != "N/A") %>% 
+  mutate(Moffitt = factor(Moffitt, levels=c("Classical","Basal-like","N/A")),) %>%
+  # filter(purity=="high") %>% 
+ggbetweenstats(x=Moffitt, y=Hypoxia_pathway,
+               plot.type="box", type="np", p.adjust.method="BH",
+               point.args=list(alpha=ptalph, size=2, shape=16, position = position_quasirandom(width=qrw)),
+               mean.ci=F, notch=F, centrality.plotting = F, bf.message = F,
+               ggplot.component=geom_boxplot(size=lnsz, alpha=0, width=0.3),
+               ggtheme=theme_cowplot(10, line_size=lnsz),
+               ) +
+  scale_color_manual(values=moff_cols) +
+  labs(x="Moffitt subtype", y="Hypoxia pathway PROGENy score", title="CPTAC PDAC") 
+ggsave("Plots and images/Moffitt_Hypoxia-pathway_ggbetweenstats_RNAseq.png", width = w, height = h)
+ggsave("Plots and images/Moffitt_Hypoxia-pathway_ggbetweenstats_RNAseq.pdf", width = w, height = h)
+
+
+# Non-ggstatsplot plot:
+spls %>% 
+  inner_join(mp_data, by="case_id", suffix=c("",".x")) %>% filter(Moffitt != "N/A") %>% 
+  mutate(Moffitt = factor(Moffitt, levels=c("Classical","Basal-like","N/A")),) %>% 
+  # filter(purity=="high") %>% 
+  ggplot(aes(x=Moffitt, y=Hypoxia_pathway, fill=Moffitt)) + 
+    geom_violin(width=viow, alpha=vioa, color="black") + 
+    geom_boxplot(color="black", fill="white", outlier.shape=NA, width=bplotw) +
+    # geom_quasirandom(size=ptsz, alpha=ptalph, shape=16, position=position_quasirandom(width=qrw)) +
+    geom_quasirandom(aes(size=PCEMT_MESENCHYMAL), alpha=ptalph, shape=16, position=position_quasirandom(width=qrw)) +
+    scale_fill_manual(values=moff_cols) + scale_size_continuous(range=ptszrng) +
+    theme_cowplot(fntsz, rel_small=1, rel_large=1, line_size=lnsz) + 
+    labs(title="CPTAC PDAC", x="Moffitt subtype", y="Hypoxia pathway PROGENy score") +
+    guides(color="none", fill="none")
+ggsave("Plots and images/Moffitt_Hypoxia-pathway_comps_RNAseq.pdf", width = w*1.15, height = h)
+ggsave("Plots and images/Moffitt_Hypoxia-pathway_comps_RNAseq.png", width = w*1.15, height = h)
+```
+
+
+```{r Bailey-Hypoxia comparisons}
+lnsz <- 0.5
+w <- 7.3/1.4
+h <- 3.5/1.5
+ptalph <- 0.7
+ptsz <- 2
+bplotw <- 0.15
+viow <- 0.75
+vioa <- 0.5
+ptszrng <- c(0.25,2)
+qrw <- 0.1
+fntsz <- 8
+
+## =============== Hallmark Hypoxia comparisons: Boxplot/t-test =============== ##
+spls %>% 
+  inner_join(mp_data, by="case_id", suffix=c("",".x")) %>% filter(Bailey != "N/A") %>% 
+  # filter(purity=="high") %>% 
+ggbetweenstats(x=Bailey, y=HALLMARK_HYPOXIA,
+               plot.type="box", type="np", p.adjust.method="BH",
+               point.args=list(alpha=ptalph, size=2, shape=16, position = position_quasirandom(width=qrw)),
+               # point.args=list(alpha=ptalph, size=2, shape=16, position = position_beeswarm()),
+               mean.ci=F, notch=F, centrality.plotting = F, bf.message = F,
+               ggplot.component=geom_boxplot(size=lnsz, alpha=0, width=0.3),
+               ggtheme=theme_cowplot(fntsz, rel_small=1, rel_large=1, line_size=lnsz),
+               ) +
+  scale_color_manual(values=bail_cols) +
+  labs(x="Bailey subtype", y="Hallmark Hypoxia enrichment score", title="CPTAC PDAC") 
+ggsave("Plots and images/Bailey_Hallmark-Hypoxia_ggbetweenstats_RNAseq.png", width = w, height = h)
+ggsave("Plots and images/Bailey_Hallmark-Hypoxia_ggbetweenstats_RNAseq.pdf", width = w, height = h)
+
+# Non-ggstatsplot plot:
+spls %>% 
+  inner_join(mp_data, by="case_id", suffix=c("",".x")) %>% filter(Bailey != "N/A") %>% 
+  # filter(purity=="high") %>% 
+  ggplot(aes(x=Bailey, y=HALLMARK_HYPOXIA, fill=Bailey)) + 
+    geom_violin(width=viow, alpha=vioa, color="black") + 
+    geom_boxplot(color="black", fill="white", outlier.shape=NA, width=bplotw) +
+    # geom_quasirandom(size=ptsz, alpha=ptalph, shape=16, position=position_quasirandom(width=qrw)) +
+    geom_quasirandom(aes(size=PCEMT_MESENCHYMAL), alpha=ptalph, shape=16, position=position_quasirandom(width=qrw)) +
+    scale_fill_manual(values=bail_cols) + scale_size_continuous(range=ptszrng) +
+    theme_cowplot(fntsz, rel_small=1, rel_large=1, line_size=lnsz) +
+    # theme_minimal_grid(12) + 
+    labs(title="CPTAC PDAC", x="Bailey subtype", y="Hallmark Hypoxia enrichment score") +
+    guides(color="none", fill="none")
+ggsave("Plots and images/Bailey_Hallmark-Hypoxia_comps_RNAseq.pdf", width = w*1.15, height = h)
+ggsave("Plots and images/Bailey_Hallmark-Hypoxia_comps_RNAseq.png", width = w*1.15, height = h)
+
+
+## =============== HIF signature comparisons: Boxplot/t-test =============== ##
+spls %>% 
+  inner_join(mp_data, by="case_id", suffix=c("",".x")) %>% filter(Bailey != "N/A") %>% 
+  # filter(purity=="high") %>% 
+ggbetweenstats(x=Bailey, y=HIF_SIGNATURE,
+               plot.type="box", type="np", p.adjust.method="BH",
+               # point.args=list(alpha=ptalph, size=2, shape=16, position = position_quasirandom(width=qrw)),
+               point.args=list(alpha=ptalph, size=2, shape=16, position = position_quasirandom(width=qrw)),
+               mean.ci=F, notch=F, centrality.plotting = F, bf.message = F,
+               ggplot.component=geom_boxplot(size=lnsz, alpha=0, width=0.3),
+               ggtheme=theme_cowplot(fntsz, rel_small=1, rel_large=1, line_size=lnsz),
+               ) +
+  scale_color_brewer(palette="Dark2") +
+  labs(x="Bailey subtype", y="HIF signature enrichment score", title="CPTAC PDAC") 
+ggsave("Plots and images/Bailey_HIF-sig_ggbetweenstats_RNAseq.png", width = w, height = h)
+ggsave("Plots and images/Bailey_HIF-sig_ggbetweenstats_RNAseq.pdf", width = w, height = h)
+
+
+# Non-ggstatsplot plot:
+spls %>% 
+  inner_join(mp_data, by="case_id", suffix=c("",".x")) %>% filter(Bailey != "N/A") %>% 
+  # filter(purity=="high") %>% 
+  ggplot(aes(x=Bailey, y=HIF_SIGNATURE, fill=Bailey)) + 
+    geom_violin(width=viow, alpha=vioa, color="black") + 
+    geom_boxplot(color="black", fill="white", outlier.shape=NA, width=bplotw) +
+    # geom_quasirandom(size=ptsz, alpha=ptalph, shape=16, position=position_quasirandom(width=qrw)) +
+    geom_quasirandom(aes(size=PCEMT_MESENCHYMAL), alpha=ptalph, shape=16, position=position_quasirandom(width=qrw)) +
+    scale_fill_manual(values=bail_cols) + scale_size_continuous(range=ptszrng) +
+    theme_cowplot(fntsz, rel_small=1, rel_large=1, line_size=lnsz) +
+    # theme_minimal_grid(12) + 
+    labs(title="CPTAC PDAC", x="Bailey subtype", y="HIF signature enrichment score") +
+    guides(color="none", fill="none")
+ggsave("Plots and images/Bailey_HIF-sig_comps_RNAseq.pdf", width = w*1.15, height = h)
+ggsave("Plots and images/Bailey_HIF-sig_comps_RNAseq.png", width = w*1.15, height = h)
+
+
+
+## =============== Hypoxia pathway PROGENy score comparisons: Boxplot/t-test =============== ##
+spls %>% 
+  inner_join(mp_data, by="case_id", suffix=c("",".x")) %>% filter(Bailey != "N/A") %>% 
+  # filter(purity=="high") %>% 
+ggbetweenstats(x=Bailey, y=Hypoxia_pathway,
+               plot.type="box", type="np", p.adjust.method="BH",
+               point.args=list(alpha=ptalph, size=2, shape=16, position = position_quasirandom(width=qrw)),
+               mean.ci=F, notch=F, centrality.plotting = F, bf.message = F,
+               ggplot.component=geom_boxplot(size=lnsz, alpha=0, width=0.3),
+               ggtheme=theme_cowplot(10, line_size=lnsz),
+               ) +
+  scale_color_manual(values=bail_cols) +
+  labs(x="Bailey subtype", y="Hypoxia pathway PROGENy score", title="CPTAC PDAC") 
+ggsave("Plots and images/Bailey_Hypoxia-pathway_ggbetweenstats_RNAseq.png", width = w, height = h)
+ggsave("Plots and images/Bailey_Hypoxia-pathway_ggbetweenstats_RNAseq.pdf", width = w, height = h)
+
+
+# Non-ggstatsplot plot:
+spls %>% 
+  inner_join(mp_data, by="case_id", suffix=c("",".x")) %>% filter(Bailey != "N/A") %>% 
+  # filter(purity=="high") %>% 
+  ggplot(aes(x=Bailey, y=Hypoxia_pathway, fill=Bailey)) + 
+    geom_violin(width=viow, alpha=vioa, color="black") + 
+    geom_boxplot(color="black", fill="white", outlier.shape=NA, width=bplotw) +
+    # geom_quasirandom(size=ptsz, alpha=ptalph, shape=16, position=position_quasirandom(width=qrw)) +
+    geom_quasirandom(aes(size=PCEMT_MESENCHYMAL), alpha=ptalph, shape=16, position=position_quasirandom(width=qrw)) +
+    scale_fill_manual(values=bail_cols) + scale_size_continuous(range=ptszrng) +
+    theme_cowplot(fntsz, rel_small=1, rel_large=1, line_size=lnsz) + 
+    labs(title="CPTAC PDAC", x="Bailey subtype", y="Hypoxia pathway PROGENy score") +
+    guides(color="none", fill="none")
+ggsave("Plots and images/Bailey_Hypoxia-pathway_comps_RNAseq.pdf", width = w*1.15, height = h)
+ggsave("Plots and images/Bailey_Hypoxia-pathway_comps_RNAseq.png", width = w*1.15, height = h)
+```
+
+
+## PDAC signature proportion comparisons across NMF pcEMT clusters
+```{r}
+w = 3.8
+h = 4
+
+## Combined:
+# spls %>% 
+#   inner_join(mp_data, by="case_id", suffix=c("",".x")) %>%
+#   dplyr::select(NMF, Collisson, Moffitt, Bailey) %>%
+#   pivot_longer(-NMF) %>% 
+#   filter(value != "N/A") %>% 
+#   mutate(
+#     value = factor(value, levels=rev(unique(value))),
+#   ) %>%
+#   grouped_ggbarstats(value, NMF, grouping.var=name,
+#                      palette="default_jama", package="ggsci",
+#                      xlab="pcEMT NMF cluster",
+#                      )
+  
+
+## Collisson:
+spls %>% 
+  inner_join(mp_data, by="case_id", suffix=c("",".x")) %>%
+  dplyr::select(NMF, Collisson) %>%
+  filter(Collisson != "N/A") %>% 
+  mutate(
+    Collisson = factor(Collisson, levels=rev(c("Classical","Exocrine-like","Quasimesenchymal"))),
+  ) %>%
+  ggbarstats(Collisson, NMF, xlab="pcEMT NMF cluster") +
+    scale_fill_viridis_d(option="plasma")
+ggsave("Plots and images/ggbarstats_Collisson-pcEMT_proportions_RNAseq.png", width=w, height=h)
+ggsave("Plots and images/ggbarstats_Collisson-pcEMT_proportions_RNAseq.pdf", width=w, height=h)
+
+    
+## Moffitt:
+spls %>% 
+  inner_join(mp_data, by="case_id", suffix=c("",".x")) %>%
+  dplyr::select(NMF, Moffitt) %>%
+  filter(Moffitt != "N/A") %>% 
+  mutate(
+    Moffitt = factor(Moffitt, levels=rev(c("Basal-like","Classical"))),
+  ) %>%
+  ggbarstats(Moffitt, NMF, xlab="pcEMT NMF cluster") +
+    scale_fill_viridis_d(option="cividis", direction=-1)
+ggsave("Plots and images/ggbarstats_Moffitt-pcEMT_proportions_RNAseq.png", width=w*0.85, height=h)
+ggsave("Plots and images/ggbarstats_Moffitt-pcEMT_proportions_RNAseq.pdf", width=w*0.85, height=h)
+
+
+## Bailey:
+spls %>% 
+  inner_join(mp_data, by="case_id", suffix=c("",".x")) %>%
+  dplyr::select(NMF, Bailey) %>%
+  filter(Bailey != "N/A") %>% 
+  mutate(
+    Bailey = factor(Bailey, levels=rev(c("ADEX","Immunogenic","Pancreatic progenitor","Squamous"))),
+  ) %>%
+  ggbarstats(Bailey, NMF, xlab="pcEMT NMF cluster") +
+    scale_fill_viridis_d(option="viridis")
+ggsave("Plots and images/ggbarstats_Bailey-pcEMT_proportions_RNAseq.png", width=w, height=h)
+ggsave("Plots and images/ggbarstats_Bailey-pcEMT_proportions_RNAseq.pdf", width=w, height=h)
+```
+
+
+
+# Survival analysis
+Here we evaluate the survival probabilities of patients based on grouping tumors based on molecular subtypes/clusters.
+```{r Load survival information}
+## Add survival data to annotations for the tumors with RNA-seq data:
+surv_data <- spls %>% 
+  inner_join(mp_data, by="case_id", suffix=c("",".x")) %>% 
+  mutate(
+    OS = vital_status,
+    OS = replace(OS, vital_status=="Deceased", 1),
+    OS = replace(OS, vital_status=="Living", 0),
+    OS = replace(OS, vital_status=="NA", NA),
+    OS.time = as.numeric(follow_up_days),
+    OS.time.months = as.numeric(follow_up_days)/30,
+    ) %>% 
+  na.omit() %>% 
+  mutate(OS = as.numeric(OS)) %>% 
+  mutate(
+    hyppath = as.numeric(Hypoxia_pathway>median(Hypoxia_pathway))+1,
+    hyppath = replace(hyppath, hyppath==1,"Low"),
+    hyppath = replace(hyppath, hyppath==2,"High"),
+    hyppath = factor(hyppath, levels=c("Low","High")),
+    hallhyp = as.numeric(HALLMARK_HYPOXIA>median(HALLMARK_HYPOXIA))+1,
+  )
+
+surv_data2 <- surv_data
+# surv_data2 <- surv_data %>% filter(purity=="high")
+# surv_data2 <- surv_data %>% filter(OS.time > 10)
+
+dss_data <- surv_data2 %>% 
+  filter(cause_of_death=="pancreatic carcinoma"|cause_of_death=="na")
+
+```
+
+
+```{r pcEMT NMF clusters}
+w = 3.5
+h = 3
+surv_colors <- annotcols2[2:1]
+surv_xbreaks <- 200
+plot_cis <- F
+## Set up survival object:
+km1 <- Surv(time = surv_data2$OS.time, event = surv_data2$OS)
+km2 <- Surv(time = dss_data$OS.time, event = dss_data$OS)
+
+## =============== pcEMT, 2 NMF clusters =============== ##
+## Fit Kaplan-Meier, stratifying by M-high/low status, OS:
+km1_pcemt <- survfit(km1 ~ NMF, data = surv_data2, type = "kaplan-meier", conf.type = "log")
+km1_pcemt
+survdiff(km1~NMF, data = surv_data2) # Chi-squared test
+ggsurvplot(km1_pcemt, conf.in=plot_cis, pval=T, break.x.by=surv_xbreaks, palette=surv_colors[c(2,1)],
+           font.title=c(8,"bold"),
+           font.x=8,
+           font.y=8,
+           font.tickslab=8,
+           font.caption=8,
+           font.subtitle=8,
+           font.legend=8,
+           pval.size=3,
+           ) + 
+  labs(title="Overall survival (OSS)", x="Days")
+ggsave("Plots and images/KM_NMF-2_OS_RNAseq.png", w=w, h=h)
+ggsave("Plots and images/KM_NMF-2_OS_RNAseq.pdf", w=w, h=h)
+
+## Fit Kaplan-Meier, stratifying by M-high/low status, DSS:
+km2_pcemt <- survfit(km2 ~ NMF, data = dss_data, type = "kaplan-meier", conf.type = "log")
+km2_pcemt
+survdiff(km2~NMF, data = dss_data) # Chi-squared test
+ggsurvplot(km2_pcemt, conf.in=plot_cis, pval=T, break.x.by=surv_xbreaks, palette=surv_colors[c(2,1)],
+           font.title=c(8,"bold"),
+           font.x=8,
+           font.y=8,
+           font.tickslab=8,
+           font.caption=8,
+           font.subtitle=8,
+           font.legend=8,
+           pval.size=3,
+           ) + 
+  labs(title="Disease-specific survival (DSS)", x="Days")
+ggsave("Plots and images/KM_NMF-2_DSS_RNAseq.png", w=w, h=h)
+ggsave("Plots and images/KM_NMF-2_DSS_RNAseq.pdf", w=w, h=h)
+
+
+```
+
+
+# pcEMT mRNA-protein correlations
+```{r Load and format proteomics data for pcEMT signature}
+## Load proteomics data:
+fn_prot <- "CPTAC PDAC data/PDAC_LinkedOmics_Data/proteomics_gene_level_MD_abundance_tumor.cct" # raw mass-spec data for all samples analyzed
+prot <- read_tsv(fn_prot)
+colnames(prot)[1] <- "gene"
+colnames(prot) <- make.names(colnames(prot))
+
+# -- Pivot protein expression longer for matching with RNA-seq data:
+pcemt_prot <- prot %>% filter(gene %in% pcemt.sig$gene) %>% 
+  pivot_longer(-gene, names_to="case_id", values_to="protein") %>% 
+  na.omit()
+
+```
+
+```{r Protein-mRNA correlations, warning=F, message=F}
+# -- Combine mRNA and protein expression for pcEMT sig:
+pcemt_comb <- data1 %>% filter(gene %in% pcemt.sig$gene) %>%
+  pivot_longer(-gene, names_to="case_id", values_to="RNA") %>% 
+  na.omit() %>% 
+  inner_join(pcemt_prot, by=c("gene","case_id"))
+
+# -- Analyze correlations:
+pcemt_comb %>%
+  filter(gene %in% c("CDH1","VIM","FN1","CDH2")) %>% 
+  grouped_ggscatterstats(x=RNA, y=protein, grouping.var=gene,
+                         marginal=F,
+                         bf.message=F,
+                         )
+# ggsave("Plots and images/CPTAC_pcEMT_protein-mRNA_scatterstats.png", width=40, height=40)
+# ggsave("Plots and images/CPTAC_pcEMT_protein-mRNA_scatterstats.pdf", width=40, height=40)
+
+
+# -- Correlations at gene level:
+w1 = 5 # 3
+h1 = 5.5 # 7
+pcemt_comb %>% 
+  grouped_ggcorrmat(grouping.var=gene,
+                    output="dataframe"
+                    ) %>% 
+  inner_join(pcemt.sig, by="gene") %>% 
+  mutate(type = case_when(type=="E"~"Epithelial",type=="M"~"Mesenchymal",T~type)) %>% 
+  arrange(estimate) %>% 
+  mutate(gene = factor(gene, levels=gene)) %>% 
+  ggplot(aes(x=estimate, y=gene, color=type, fill=type)) +
+    geom_vline(xintercept=0, linetype=2) +
+    geom_errorbarh(aes(xmax=conf.high, xmin=conf.low), color="black", height=0) + 
+    geom_point() +
+    facet_wrap(~type, scales="free_y") +
+    scale_color_manual(values=brewer.pal(4, name="Set1")[3:4]) +
+    scale_fill_manual(values=brewer.pal(4, name="Set1")[3:4]) +
+    theme_cowplot(8, rel_small=1, rel_tiny=1, rel_large=1) + background_grid(major="none", minor="x") +
+    panel_border(color="black", size=1) +
+    labs(x="Pearson correlation", y="Gene", title="CPTAC PDAC\npcEMT protein-mRNA correlations")
+ggsave("Plots and images/CPTAC_pcEMT_protein-mRNA_corrs.png", width=w1, height=h1, dpi=300)
+ggsave("Plots and images/CPTAC_pcEMT_protein-mRNA_corrs.pdf", width=w1, height=h1)
+
+
+
+# -- Distribution of pcEMT protein-mRNA correlations:
+w2 = 3
+h2 = 1.8
+pcemt_comb %>% 
+  grouped_ggcorrmat(grouping.var=gene,
+                    output="dataframe"
+                    ) %>% 
+  ggplot(aes(x=estimate, label=gene)) +
+    geom_histogram(fill=brewer.pal(5,"Accent")[5], color="black", bins=30) +
+    # geom_histogram(aes(y=..density..), fill=brewer.pal(5,"Accent")[5], color="black", bins=30) +
+    # geom_density(fill=brewer.pal(5,"Accent")[5], alpha=0.25) +
+    geom_vline(aes(xintercept=median(estimate)), linetype=2, color="red") +
+    # geom_label_repel(stat="bin") +
+    scale_y_continuous(expand=expansion(mult=c(0, 0.05))) +
+    theme_cowplot(8, rel_small=1, rel_tiny=1, rel_large=1) + 
+    labs(x="Pearson correlation", y="Number of genes", title="CPTAC PDAC\npcEMT protein-mRNA correlations")
+ggsave("Plots and images/CPTAC_pcEMT_protein-mRNA_corrs-dist.png", width=w2, height=h2, dpi=300)
+ggsave("Plots and images/CPTAC_pcEMT_protein-mRNA_corrs-dist.pdf", width=w2, height=h2)
+```
+
+
+
+# Session info
+```{r Print session info}
+sink("sessionInfo_CPTAC_RNAseq.txt")
+sessionInfo()
+sink()
+```

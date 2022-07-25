@@ -1,0 +1,2069 @@
+---
+title: "Analysis of RNA-seq data from PDX cell lines and patient tumors from UVA"
+author: Paul J. Myers
+output:
+  html_document:
+    fig_width: 9
+    fig_height: 6
+    toc: yes
+  pdf_document: 
+    toc: yes
+    fig_width: 9
+    fig_height: 6
+Date of creation: "1/06/2021"
+R version: "4.1.0"
+---
+
+# Housekeeping Code
+
+We start by loading some of the desired libraries for this script. Additional packages will be loaded later for specific analyses to make their use clear.
+
+```{r Load packages, message=F, warning=F}
+### Load packages:
+library(tidyverse)
+library(magrittr)
+library(BiocManager)
+library(paletteer)
+library(cowplot)
+library(ggrepel)
+library(ggbeeswarm)
+library(ggstatsplot)
+library(Hmisc)
+library(pcaMethods)
+library(pheatmap)
+library(ComplexHeatmap)
+library(tidyHeatmap)
+library(parallel)
+library(M3C)
+library(org.Hs.eg.db)
+```
+
+```{r Clear workspace}
+## Clear R workspace:
+rm(list=ls())
+```
+
+```{r Check working directory}
+## Check that current working directory is correct and the desired one:
+cwd <- getwd()
+cwd
+```
+
+```{r Define "not in" operator}
+## Define 'not in' (ni) operator
+`%ni%` <- Negate(`%in%`)
+
+## Custom mode function:
+getmode <- function(v) {
+   uniqv <- unique(v)
+   uniqv[which.max(tabulate(match(v, uniqv)))]
+}
+```
+
+The function below can be used to generate a ggplot with a blank grid and black box surrounding the plot area.
+
+```{r Custom ggplot theme for plot background}
+theme_cust <- function(ticks=T, axis="y", box=T, lnsz=1, 
+                       grid=F, grid_major=F, grid_minor=F, 
+                       gridlnsz=0.5, gridlnsz_major=0.5, gridlnsz_minor=gridlnsz_major/2,
+                       grid_linetype="dashed", grid_color="grey80",
+                       xtickangle=0, hjust=NULL, vjust=NULL, fill=NA,
+                       legend.position="right", strip_color=NA, strip_background=NA){
+  theme_out <- theme(legend.position=legend.position, 
+                     strip.background=element_rect(colour=strip_color, fill=strip_background),
+                     )
+  
+  if (ticks == FALSE & axis == "y" ){
+    theme_out <- theme_out + theme(
+      axis.text.y = element_blank(), axis.ticks.y = element_blank(), # Make y axis ticks blank
+      axis.line.y = element_blank(),
+      axis.line.x = element_blank(),
+      panel.background = element_rect(size = lnsz, color = "black", fill = fill),
+      )
+  }
+  else if (ticks == FALSE & axis != "y"){
+    theme_out <- theme_out + theme(
+      axis.text.x = element_blank(), axis.ticks.x = element_blank(), # Make x axis ticks blank
+      axis.line.y = element_blank(),
+      axis.line.x = element_blank(),
+      panel.background = element_rect(size = lnsz, color = "black", fill = fill),
+      )
+  }
+  else {
+     theme_out <- theme_out + theme(
+       axis.line.y = element_blank(),
+       axis.line.x = element_blank(),
+       panel.background = element_rect(size = lnsz, color = "black", fill = fill),
+       axis.text.x = element_text(angle=xtickangle, hjust = hjust, vjust=vjust),
+       ) 
+  }
+  if (!box) {
+    theme_out <- theme_out + theme(panel.background = element_blank(),
+                                   axis.line.y = element_line(size = lnsz, color = "black"),
+                                   axis.line.x = element_line(size = lnsz, color = "black")
+                                   )
+  }
+  # Grid lines:
+  if ((grid_major & grid_minor) | grid){
+    theme_out <- theme_out + 
+      theme(panel.grid = element_line(color=grid_color,
+                                      size = gridlnsz,
+                                      linetype = grid_linetype)
+            )
+  } else if (grid_major & !grid_minor){
+    theme_out <- theme_out + 
+      theme(panel.grid.major = element_line(color=grid_color,
+                                      size = gridlnsz_major,
+                                      linetype = grid_linetype)
+            )
+  } else if (!grid_major & grid_minor){
+    theme_out <- theme_out + 
+      theme(panel.grid.minor = element_line(color=grid_color,
+                                      size = gridlnsz_minor,
+                                      linetype = grid_linetype)
+            )    
+  }
+  return(theme_out)
+}
+
+# Julia's Plots.jl default color order:
+julia_cols <- c("#009AFA","#E26E47","#3FA54E","#c270D2","#AD8F18","#01ABAE","#ED5F92","#C68324","#01A98C","#8F961E","#01A9CD","#9B7EE8","#618CF7","#F16072","#DC65B7","#6D9E33") %>% rep.int(4)
+```
+
+# Load and clean data
+
+The data were provided in FPKM expression units with the gene lengths used to calculate these values. We'd like to use TPM (transcripts per million) instead, so we're going to convert the data into TPM from the RPKM values and the given gene lengths.
+
+```{r Load data}
+## Load RNA-seq and clinical/phenotype data:
+library(readxl)
+fn.fpkm <- "fpkm_genename2020.xlsx" # file with data in FPKM units
+fn.spls <- "sample_types.csv" # file with sample type annotations
+fn.clin <- "clinical_phenotypes.csv" # file with clinical phenotype annotations/data
+data.all <- read_xlsx(fn.fpkm, skip = 1) %>%
+  data.frame() # load RNA-seq data
+spls <- read_csv(fn.spls) %>%
+  data.frame(row.names = .$spl) # load sample types/annotation data
+spls.pdx <- spls %>% 
+  subset(PDX_line %ni% "None")
+spls.tumors <- spls %>% 
+  filter(spl_type == "Tumor")
+clin_data <- read_csv(fn.clin) # load clinical/phenotype data
+clin_data <- clin_data %>%
+  mutate(PDX_line = match(spl,spls.pdx$spl) %>% spls.pdx$PDX_line[.]) # add associated PDX cell line names to clinical data
+
+
+## Stelow's updated differentiation and tumor grading from 6/21/21:
+fn_stelow_F0 <- "Stelow_F0_differentiation-stroma_6-21-21.csv"
+fn_stelow_PDX <- "Stelow_PDX-tumor_differentiation-stroma_6-21-21.csv"
+stelow_F0 <- read_csv(fn_stelow_F0) %>% # data for F0 tumors
+  na.omit() %>% 
+  separate(F0_spl_id, c("spl_id","F0_spl_id2")," ")
+stelow_PDX <- read_csv(fn_stelow_PDX) %>% # data for PDX tumors
+  na.omit() %>% 
+  separate(PDX_spl_id, c("spl_id","PDX_spl_id2")," ")
+
+# Merge Stelow differentiation/stroma data with rest of spl/phenotype data:
+spls_stelow <- spls %>% 
+  inner_join(stelow_F0, by="spl_id") %>% 
+  inner_join(stelow_PDX, by="spl_id")
+```
+
+```{r Gene names and IDs}
+## Load Entrez gene IDs that match ENSEMBL IDs:
+fn.entrez <- "entrezIDs.csv"
+
+if(file.exists(fn.entrez)){
+  entrezIDs <- read.csv(fn.entrez)
+} 
+
+## Use biomaRt to get ENTREZ gene IDs if the file doesn't exist:
+if(!exists("entrezIDs")){
+  library(biomaRt)
+  mart <- useDataset("hsapiens_gene_ensembl", useMart("ensembl"))
+
+  entrezIDs <- getBM(
+    filters="ensembl_gene_id",
+    attributes=c("ensembl_gene_id", "entrezgene_id"),
+    values=data.all$geneID,
+    mart=mart)
+  entrezIDs$entrezgene_id[entrezIDs$ensembl_gene_id=="ENSG00000227953"] <- 149134 # ENTREZ ID for LOC149134 gene
+  write.csv(entrezIDs,"entrezIDs.csv",row.names = F)
+}
+
+
+## Get effective gene lengths:
+gene_lengths <- data.all %>% 
+  dplyr::select(geneID, Gene_name, GeneLength)
+```
+
+Now we convert the data from FPKM units to TPM units. As described in [Mortazavi et al.](https://doi.org/10.1038/nmeth.1226), RPKM/FPKM are calculated as $$ FPKM_i = \frac{X_i}{\tilde{l}_i N}*10^9 $$ where $X_i$ is the number of counts mapped to a feature (gene) $i$, $\tilde{l}_i$ is the effective gene length, and $N$ is the total number of counts within a sample.
+
+The formula for TPM, which was originally described in [Li et al.](https://doi.org/10.1093/bioinformatics/btp692) is given by $$ TPM_i = \frac{X_i}{\tilde{l}_i}\left(\frac{1}{\Sigma_j\frac{X_j}{\tilde{l}_j }}\right) * 10^6 $$ where the $\Sigma_j$ is the summation of feature rates over all features within a sample.
+
+Using these expressions and the relationships described in [this article](https://arxiv.org/abs/1104.3889v2) by Lior Pachter, it can be shown that TPM can be calculated from RPKM/FPKM according to $$ TPM_i = \left(\frac{FPKM_i}{\Sigma_j FPKM_j}\right) 10^6$$
+
+```{r Clean the data and convert to TPM units}
+ ################ CHOOSE WHETHER TO USE ONLY PROTEIN CODING GENES OR NOT ################
+use_pc_genes_only <- T # TRUE = protein-coding genes only, FALSE = all available genes
+if(use_pc_genes_only){
+  ## Pull out just the protein-coding genes:
+  data <- data.all %>% 
+    subset(Gene_type %in% "protein_coding") 
+  rownames(data) <- data$geneID
+  
+  ## Get just the FPKM values:
+  fpkm <- data %>% 
+    dplyr::select(-c(geneID, Gene_name, Chrom, Strand, Start, End, GeneLength, Gene_type, Description))
+  rownames(fpkm) <- data$geneID
+
+  ## Calculate TPM directly from FPKM values for the protein-coding genes only:
+  tpm <- t(t(fpkm)/colSums(fpkm)*1e6) %>% data.frame() # Just the TPM values
+  logtpm <- log2(tpm+1) # log2-transformed with pseudo-count 1 
+  rownames(tpm) <- data$geneID # set row names using ENSEMBL gene IDs
+  rownames(logtpm) <- data$geneID
+  
+} else {
+  data <- data.all
+  rownames(data) <- data$geneID
+  
+  ## Get just the FPKM values:
+  fpkm <- data %>% 
+    dplyr::select(-c(geneID, Gene_name, Chrom, Strand, Start, End, GeneLength, Gene_type, Description))
+  rownames(fpkm) <- fpkm$geneID
+  
+  ## Calculate TPM directly from FPKM values using ALL genes in the data set:
+  tpm <- t(t(fpkm)/colSums(fpkm)*1e6) %>% data.frame() # Just the TPM values
+  logtpm <- log2(tpm+1) # log2-transformed with pseudo-count 1 
+  rownames(tpm) <- data$geneID # set row names using ENSEMBL gene IDs
+  rownames(logtpm) <- data$geneID
+}
+
+### Filter duplicate genes (based on gene symbol) by taking the Ensembl IDs with the highest variance:
+gene_var <- apply(tpm, 1, var) %>% # calculate gene-wise variances
+  data.frame(var=., geneID = names(.)) %>% # transform to data frame
+  mutate(
+    geneSymbol = match(geneID, data$geneID) %>% data$Gene_name[.] # get gene symbols
+    ) %>% 
+  group_by(geneSymbol) %>% 
+  summarise(max(var), geneID = geneID) # select which Ensembl ID from each gene symbol has the highest variance 
+  
+
+### Filter the expression data with the selected Ensembl IDs from variance filtering:
+tpm_filt <- tpm %>% 
+  filter(rownames(.) %in% gene_var$geneID)
+
+logtpm_filt <- logtpm %>% 
+  filter(rownames(.) %in% gene_var$geneID)
+
+
+### Data with gene symbols instead of Ensembl gene IDs:
+tpm_symbol <- tpm_filt
+rownames(tpm_symbol) <- rownames(tpm_symbol) %>% match(data$geneID) %>% data$Gene_name[.] %>% make.names(unique=T)
+logtpm_symbol <- logtpm_filt # for log-transformed TPM values
+rownames(logtpm_symbol) <- rownames(logtpm_symbol) %>% match(data$geneID) %>% data$Gene_name[.] %>% make.names(unique=T)
+```
+
+The data are now ready to be analyzed.
+
+
+# Gene signatures of interest
+
+Here we define the 13-gene (G13) signature from [Newhook et al.](https://doi.org/10.1371/journal.pone.0105631) and pull out the expression data for it.
+
+```{r G13 signature}
+g13.sig <- c("PRKCSH","PLCG1","RP11-439E19.3","CCDC88C","CUL3","ELAVL1","ULBP3","RIMKLB","CDH5","CD200R1","MS4A3","MDM2","TGFA") 
+# g13.sig <- c("PRKCSH","PLCG1","LOC149134","CCDC88C","CUL3","ELAVL1","ULBP3","RIMKLB","CDH5","CD200R1","MS4A3","MDM2","TGFA") 
+
+g13 <- match(g13.sig, data$Gene_name) %>% 
+  logtpm[.,] %>% 
+  data.frame(row.names = g13.sig) %>% 
+  na.omit()
+```
+
+Next we introduce the "HIF signature" -- a set of 44 HIF transcription factor target genes that were described/used by [Li et al. (2014)](https://doi.org/10.1038/nature13557).
+
+```{r HIF signature}
+hif.sig <- c("IGFBP3", "EDN2", "PFKFB4", "FLT1", "TFR2", "BNIP3L", "TGFA","BNIP3","PGK1","EGLN1","LDHA","EGLN3","CP","TGFB3","PFKFB3",
+             "HK1","TFRC","EDN1","CDKN1A","CA9","ADM1","HMOX1","SERPINE1","LOX","NDRG1","CA12","PDK1","VEGFA","ERO1L","RORA","P4HA1","MXI1",
+             "SLC2A1","STC2","MIF","DDIT4","ENO1","CXCR4","PLOD1","P4HA2","GAPDH","PGAM1","TMEM45A","PIM1")
+
+## TPM:
+tpm.hif <- match(hif.sig, data$Gene_name) %>% na.omit() %>% tpm[.,]
+
+## log2(TPM+1):
+logtpm.hif <- match(hif.sig, data$Gene_name) %>% na.omit() %>% logtpm[.,]
+```
+
+An additional, 8-gene hypoxia gene signature is described by [Khouzam et al. (2021)](https://doi.org/10.3389/fimmu.2021.680435) and is predictive of survival in pancreatic cancer, as well as an immunosuppressed microenvironment, according to the authors.
+
+```{r Hypoxia-8 gene set, message=F, warning=F}
+hyp8_sig <- c("LDHA","SLC2A1","ANGPTL4","VEGFA","LOX","P4HA1","BNIP3","DDIT4")
+
+## TPM:
+tpm.hyp8 <- match(hyp8_sig, data$Gene_name) %>% na.omit() %>% tpm[.,]
+
+## log2(TPM+1):
+logtpm.hyp8 <- match(hyp8_sig, data$Gene_name) %>% na.omit() %>% logtpm[.,]
+```
+
+
+Classifying TCGA samples based on previously defined gene signatures: classical/epithelial, quasi-mesenchymal, and exocrine-like from the *Collisson PDAssigner signature*. The gene signatures were originally defined by [Collisson et al.](https://doi.org/10.1038/nm.2344) and were used by [Porter et al.](https://doi.org/10.1073/pnas.1914915116) to classify the TCGA PAAD samples. Since the latter publication does not have information on which samples were classified into which categories, we will reclassify the samples based on this signature.
+
+```{r PDAC signatures, message=F}
+## =============== Load the signatures =============== ##
+# -- Collisson:
+fn.coll <- "pdassigner_genes.csv"
+coll.sig <- read_csv(fn.coll) %>% 
+  mutate(sig = paste0("Collisson ",type))
+coll_anno <- coll.sig[,-1] %>% data.frame() 
+rownames(coll_anno) <- coll.sig$gene
+
+# -- Moffitt:
+fn.mof <- "Moffitt_PDAC_signature.txt" # PDAC subtype signature
+fn.mof_strom <- "Moffitt_stromal_signature.txt" # stromal signature
+mof.sig <- read_tsv(fn.mof) %>% 
+  mutate(sig = paste0("Moffitt ",type))
+mof_strom.sig <- read_tsv(fn.mof_strom) # Moffitt stromal signature
+
+
+# -- Bailey:
+# fn.bail <- "Bailey_PDAC_signature.txt"
+# bail.sig <- read_tsv(fn.bail) %>% 
+#   mutate(sig = paste0("Bailey ",type))
+
+fn.bail <- "BaileySubtypeSig.csv"
+bail.sig <- read_csv(fn.bail) %>% 
+  mutate(
+    gene = Symbol,
+    type = "Bailey",
+    sig = "Bailey"
+    ) %>% 
+  dplyr::select(gene, type, sig)
+
+# -- Combine them:
+pdac.sigs <- rbind(coll.sig, mof.sig, bail.sig)
+```
+
+We will also look at the immune and stromal signatures that underpin the ESTIMATE algorithm and see how their enrichment compares to the enrichment of the pcEMT signature (as well as how much overlap there is between pcEMT and these signatures). We can also compare the ESTIMATE Stromal scores from GSVA -- which we will calculate below -- to the stromal content measurements provided by Dr. Stelow's analysis.
+
+```{r ESTIMATE immune and stromal signatures, message=F}
+fn.estimate_sigs <- "../ESTIMATE_immune_stromal_signatures.txt"
+est.sig <- read_tsv(fn.estimate_sigs)
+
+est_strom <- est.sig %>% filter(type=="Stromal") %>% pull(gene)
+est_imm <- est.sig %>% filter(type=="Immune") %>% pull(gene)
+
+est_sigs <- list(ESTIMATE_IMMUNE_SIGNATURE = est_strom %>% mapIds(org.Hs.eg.db, ., "ENTREZID", "SYMBOL"),
+                  ESTIMATE_STROMAL_SIGNATURE = est_imm %>% mapIds(org.Hs.eg.db, ., "ENTREZID", "SYMBOL")) # list for GSVA calculations
+
+## Gene expression from ESTIMATE signatures:
+est <- data$Gene_name %>%
+  match(est.sig$gene) %>% na.omit() %>% 
+  logtpm[.,]
+```
+
+
+```{r pcEMT signature, warning=F, message=F}
+### Load pan-cancer EMT signature:
+pcemt.fn <- "Pan-cancer-EMT-signature_Mak-et-al-2016.txt"
+pcemt.sig <- read_tsv(pcemt.fn, col_names = c("gene","type"))
+pcemt.sig.m <- read_tsv(pcemt.fn, col_names = c("gene","type")) %>% subset(type %in% "M")
+
+### Get pcEMT signature expression data:
+pcemt <- pcemt.sig$gene %>% match(data$Gene_name) %>% logtpm[.,]
+pcemt.m <- pcemt.sig.m$gene %>% match(data$Gene_name) %>% logtpm[.,]
+rownames(pcemt) <- pcemt.sig$gene
+```
+
+# Analysis
+## M3C
+Now we perform Monte Carlo reference-based consensus clustering (M3C) using the pan-cancer EMT signature.
+
+```{r M3C calculations}
+## Get mRNA data to cluster and standardize the data:
+m3cdata1 <- pcemt %>% data.frame(row.names=rownames(.), .) %>% 
+  dplyr::select(contains("T")) %>% 
+  data.matrix() #%>% scale() # for clustering samples based on entire pcEMT
+m3cdata2 <- pcemt.m %>% data.frame(row.names=rownames(.), .) %>% 
+  dplyr::select(contains("T")) %>% 
+  data.matrix() #%>% scale() # for clustering samples based just on mesenchymal pcEMT genes
+
+## Perform M3C:
+perform_m3c <- F # Choose whether to run M3C regardless of whether it has been done already or not
+if (!file.exists("PDX_M3C_results.Rdata") | (perform_m3c)){
+  ############# Sample clustering (using pcEMT sig only) #############
+  ## Perform M3C:
+  set.seed(123) # For reproducibility
+  m3c.alg <- "pam"; mc.iters <- 100; inreps <- 250 # Algorithmic details
+  m3c1 <- M3C(m3cdata1, cores = detectCores()-1, clusteralg = m3c.alg, removeplots = T, method = 1,
+              iters = mc.iters, repsreal = inreps
+              )
+
+  
+  ############# Sample clustering (using mesenchymal part of pcEMT sig only) #############
+  ## Perform M3C:
+  set.seed(123) # For reproducibility
+  m3c.alg <- "pam"; mc.iters <- 100; inreps <- 250 # Algorithmic details
+  m3c2 <- M3C(m3cdata2, cores = detectCores()-1, clusteralg = m3c.alg, removeplots = T, method = 1,
+              iters = mc.iters, repsreal = inreps
+              )
+
+
+  #############
+  ### Save M3C results for speed:
+  save(list = c("m3c1", "m3c2"), file = "PDX_M3C_results.Rdata")
+
+} else if (file.exists("PDX_M3C_results.Rdata") & !exists("m3c1")){
+  ## Load M3C results, if they haven't been loaded already:
+  load("PDX_M3C_results.Rdata")
+}
+```
+
+### Visualize M3C results and diagnostics
+```{r Extract and plot consensus clustering results}
+plot_cc_metrics <- F
+##### Samples (using pcEMT sig only) ##################################################################
+if(plot_cc_metrics){
+  for(i in 1:length(m3c1$plots)){m3c1$plots[[i]] %>% print()} # Plots of CC metrics
+}
+## Extract results:
+m3c1.optk <- m3c1$assignments %>% max(); m3c1.optk
+m3c1.nclust <- 2
+cc.data1 <- m3c1$realdataresults[[m3c1.nclust]]$ordered_data
+anno1 <- m3c1$realdataresults[[m3c1.nclust]]$ordered_annotation
+ccmatrix1 <- m3c1$realdataresults[[m3c1.nclust]]$consensus_matrix
+
+## Check results for artifacts with PCA (or t-SNE or UMAP):
+axistxtsz <- 12 # Text size for plot axes
+M3C::pca(cc.data1, labels=anno1$consensuscluster,legendtextsize = 10,axistextsize = axistxtsz, dotsize=2) +
+  # geom_text_repel(aes(label = colnames(cc.data1)), size = 3) +
+  labs(title = "TCGA RNA-seq: PCA")
+M3C::umap(cc.data1, labels=anno1$consensuscluster,legendtextsize = 10,axistextsize = axistxtsz, dotsize=2) +
+  # geom_text_repel(aes(label = colnames(cc.data1)), size = 3) +
+  labs(title = "TCGA RNA-seq: UMAP")
+
+
+
+##### Samples (using mesenchymal pcEMT sig only) ################################################################
+if(plot_cc_metrics){
+  for(i in 1:length(m3c2$plots)){m3c2$plots[[i]] %>% print()} # Plots of CC metrics
+}
+## Extract results:
+m3c2.optk <- m3c2$assignments %>% max(); m3c2.optk
+m3c2.nclust <- 2
+cc.data2 <- m3c2$realdataresults[[m3c2.nclust]]$ordered_data
+anno2 <- m3c2$realdataresults[[m3c2.nclust]]$ordered_annotation
+ccmatrix2 <- m3c2$realdataresults[[m3c2.nclust]]$consensus_matrix
+
+## Check results for artifacts with PCA (or t-SNE or UMAP):
+axistxtsz <- 12 # Text size for plot axes
+M3C::pca(cc.data2, labels=anno2$consensuscluster,legendtextsize = 10,axistextsize = axistxtsz, dotsize=2) +
+  # geom_text_repel(aes(label = colnames(cc.data2)), size = 3) +
+  labs(title = "TCGA RNA-seq: PCA")
+M3C::umap(cc.data2, labels=anno2$consensuscluster,legendtextsize = 10,axistextsize = axistxtsz, dotsize=2) +
+  # geom_text_repel(aes(label = colnames(cc.data2)), size = 3) +
+  labs(title = "TCGA RNA-seq: UMAP")
+
+```
+
+```{r Add pcEMT annotations to sample data}
+## Clusters based on entire pcEMT signature
+if(m3c1.nclust == 2){
+  # emt_group <- c("M_low","M_high")
+  emt_group <- c(1:m3c1.nclust) %>% as.character()
+  spls <- spls %>%
+    mutate(pcEMT.cc = match(spl, rownames(anno1)) %>% anno1$consensuscluster[.] %>% emt_group[.])
+} else {
+  spls <- spls %>%
+    mutate(pcEMT.cc = match(spl, rownames(anno1)) %>% anno1$consensuscluster[.])
+  emt_group <- c(1:m3c1.nclust) %>% as.character()
+}
+# ## Clusters based on just the mesenchymal portion of the pcEMT signature:
+# if(m3c2.nclust == 2){
+#   emt_group <- c("M_low","M_high")
+#   spls <- spls %>%
+#     mutate(pcEMT = match(spl, rownames(anno2)) %>% anno2$consensuscluster[.] %>% emt_group[.])
+# } else {
+#   spls <- spls %>%
+#     mutate(pcEMT = match(spl, rownames(anno2)) %>% anno2$consensuscluster[.])
+# }
+```
+
+```{r Heatmap with M3C results, warning=F, message=F}
+### Draw a heatmap of the data:
+## Sample annotations:
+spl_annot <- spls %>%
+  dplyr::select(-contains(all_of(c("g13.score", "hif.score",".cell","associated.fibroblast","macrophage")))) %>%
+  dplyr::select(-spl) %>% 
+  data.frame(row.names = spls$spl)
+
+## Gene annotations:
+gene_annot <- data.frame(
+  row.names = pcemt.sig$gene,
+  gene_sig = pcemt.sig$type
+  )
+
+## Annotation color mappings:
+annotcols <- paletteer_d("RColorBrewer::Set1")
+annotcols2 <- c("orange","dodgerblue","limegreen","grey80")
+annotcols3 <- paletteer_d("ggthemes::Tableau_10")
+annot_colors <- list(
+  PDX_line = c("PDX188"=annotcols3[1],
+               "PDX366"=annotcols3[2],
+               "PDX395"=annotcols3[3],
+               "PDX449"=annotcols3[4],
+               "PDX608"=annotcols3[5],
+               "PDX738"=annotcols3[6],
+               "None" = "White"),
+  spl_type = c("Tumor" = annotcols2[1], "Normal" = annotcols2[2], 
+               "Cells" = annotcols2[3], "Mets" = annotcols2[4]),
+  pcEMT.cc = c("1" = annotcols[3], "2" = annotcols[3]),
+  gene_sig = c("E"=annotcols[2], "M"=annotcols[1])
+  )
+colors1 <- c("#053061FF","#2166ACFF","#4393C3FF","grey85","#D6604DFF","#B2182BFF","#67001FFF")
+
+## Draw heatmap: Entire pcEMT signature
+pheatmap::pheatmap(pcemt[,rownames(anno1)] %>% t(),
+# pheatmap::pheatmap(pcemt[,rownames(anno2)] %>% t(),
+         scale = "column",
+         clustering_method = "ward.D2", 
+         cluster_rows = F,
+         color = colorRampPalette(colors1)(101),
+         annotation_col = gene_annot, annotation_row = spl_annot,
+         annotation_colors = annot_colors,
+         show_colnames = T, angle_col = 90,
+         cutree_rows = 1, cutree_cols = 2,
+         treeheight_row = 1, treeheight_col = 1, border_color = NA,
+         # cellheight = 8,  cellwidth = 12,
+         fontsize = 8,
+         main = "PDX RNA-seq: Pan-cancer EMT signature",
+         # file="pcEMT_M3C_PDX_heatmap.png"
+         )
+
+
+## Draw heatmap: Mesenchymal pcEMT signature only, just the tumor samples
+distmet <- "manhattan"
+ptum.spls <- spls %>% subset(spl_type %in% "Tumor")
+
+# pheatmap::pheatmap(pcemt[,rownames(anno2)] %>% t(),
+pheatmap::pheatmap(pcemt[pcemt.sig.m$gene,ptum.spls$spl] %>% t(),
+         scale = "column",
+         clustering_method = "ward.D2", 
+         clustering_distance_rows = distmet, clustering_distance_cols = distmet,
+         cluster_rows = T,
+         color = colorRampPalette(colors1)(101),
+         # color = paletteer_c("viridis::plasma", n=101),
+         annotation_col = gene_annot, annotation_row = spl_annot %>% dplyr::select(-contains("pcEMT")),
+         annotation_colors = annot_colors,
+         show_colnames = T, angle_col = 90,
+         # cutree_rows = 4, cutree_cols = 2,
+         treeheight_row = 1, treeheight_col = 1, border_color = NA,
+         cellheight = 8,  #cellwidth = 12,
+         fontsize = 8,
+         main = "Primary tumor spls: pcEMT-M signature",
+         # file="pcEMT-M_M3C_PDX_heatmap.png"
+         )
+```
+
+## GSVA
+Now we load the necessary packages and gene sets from/related to the Molecular Signatures Database (MSigDB) for analyzing pathway and gene set enrichment in downstream analyses.
+
+```{r Load packages and MSigDB collections, message=F, warning=F}
+## Load packages:
+library(GSVA)
+library(msigdbr)
+
+
+### Define MSigDB gene set collection(s) to use --> retrieve with 'msigdbr' package:
+species = "Homo sapiens"
+ 
+## Retrieve Hallmark and canonical pathways collections in the database (C1-H and C2-CP):
+hall = msigdbr(species = species, category = "H")
+cp = msigdbr(species = species, category = "C2", subcategory = "CP")
+cp.b = msigdbr(species = species, category = "C2", subcategory = "CP:BIOCARTA")
+cp.r = msigdbr(species = species, category = "C2", subcategory = "CP:REACTOME")
+cp.p = msigdbr(species = species, category = "C2", subcategory = "CP:PID")
+cp.k = msigdbr(species = species, category = "C2", subcategory = "CP:KEGG")
+cp.w = msigdbr(species = species, category = "C2", subcategory = "CP:WIKIPATHWAYS")
+cp_all <- rbind(cp, cp.b, cp.r, cp.p, cp.k, cp.w)
+gene_sets1 <- rbind(hall, cp, cp.b, cp.r, cp.p, cp.k, cp.w) %>% split(x = .$entrez_gene, f = .$gs_name)
+hallemt_sig <- hall %>% filter(gs_name=="HALLMARK_EPITHELIAL_MESENCHYMAL_TRANSITION") %>% pull(gene_symbol) # Hallmark EMT genes
+hallhyp_sig <- hall %>% filter(gs_name=="HALLMARK_HYPOXIA") %>% pull(gene_symbol) # Hallmark Hypoxia genes
+
+## Go collections (C5):
+go.bp <- msigdbr(species = species, category = "C5", subcategory = "GO:BP")
+go.cc <- msigdbr(species = species, category = "C5", subcategory = "GO:CC")
+go.mf <- msigdbr(species = species, category = "C5", subcategory = "GO:MF")
+gene_sets2 <- rbind(go.bp, go.cc, go.mf) %>% split(x = .$entrez_gene, f = .$gs_name)
+
+## Transcription factor target collections (C3-TFT):
+tft <- msigdbr(species = species, category = "C3", subcategory = "TFT:GTRD")
+tft_leg <- msigdbr(species = species, category = "C3", subcategory = "TFT:TFT_Legacy")
+gene_sets3 <- rbind(tft, tft_leg) %>% split(x = .$entrez_gene, f = .$gs_name)
+
+## Pan-cancer EMT sub-signatures and HIF signature:
+pcemt_e.sig <- pcemt.sig %>% subset(type=="E") %>% dplyr::pull(gene) %>% 
+  mapIds(org.Hs.eg.db, ., "ENTREZID", "SYMBOL")
+pcemt_m.sig <- pcemt.sig %>% subset(type=="M") %>% dplyr::pull(gene) %>% 
+  mapIds(org.Hs.eg.db, ., "ENTREZID", "SYMBOL")
+
+
+gene_sets4 <- list(PCEMT_EPITHELIAL = pcemt_e.sig,
+                   PCEMT_MESENCHYMAL = pcemt_m.sig,
+                   # MYCAF_MARKERS = mycaf.sig %>% mapIds(org.Hs.eg.db, ., "ENTREZID", "SYMBOL"),
+                   # ICAF_MARKERS = icaf.sig %>% mapIds(org.Hs.eg.db, ., "ENTREZID", "SYMBOL"),
+                   # PANCAF_MARKERS = pancaf.sig %>% mapIds(org.Hs.eg.db, ., "ENTREZID", "SYMBOL"),
+                   # FIBROBLAST_MARKERS = fibro.sig %>% mapIds(org.Hs.eg.db, ., "ENTREZID", "SYMBOL"),
+                   G13_signature = g13.sig %>% mapIds(org.Hs.eg.db, ., "ENTREZID", "SYMBOL"),
+                   HIF_SIGNATURE = hif.sig %>% mapIds(org.Hs.eg.db, ., "ENTREZID", "SYMBOL"),
+                   HYPOXIA8_SIGNATURE = hyp8_sig %>% mapIds(org.Hs.eg.db, ., "ENTREZID", "SYMBOL")
+                   ) %>%
+  # append(mof_sigs) %>%
+  # append(bail_sigs) %>%
+  append(est_sigs)
+
+## Oncogenic signatures (C6):
+oncosigs = msigdbr(species = species, category = "C6")
+gene_setsC6 <- oncosigs %>% split(x = .$entrez_gene, f = .$gs_name)
+
+## Put all gene sets together for GSVA calculation:
+gene_sets_all <- gene_sets1 %>% 
+  append(gene_sets2) %>% # GO collections
+  append(gene_sets3) %>% # TFT collections
+  append(gene_sets4) %>% # pcEMT, HIF sig, fibroblast markers, etc.
+  append(gene_setsC6)
+
+
+```
+
+And now we calculate GSVA scores from the RNA-seq data.
+
+```{r GSVA calculation}
+#### Expression data prep ####
+### Format data: Samples as columns, genes as rows
+data_for_gsva <- logtpm %>% data.matrix()
+rownames(data_for_gsva) <- rownames(logtpm) %>% mapIds(org.Hs.eg.db, ., "ENTREZID", "ENSEMBL")
+
+#### Calculate GSVA scores ####
+fn_pdx <- "PDX_gsva_results.Rdata"
+force_calculate_gsva <- F
+if(!file.exists(fn_pdx) | force_calculate_gsva){
+  gsva_res <- gsva(
+    data_for_gsva, 
+    gene_sets_all, 
+    method = "gsva", 
+    kcdf = "Gaussian",
+    mx.diff = T,
+    min.sz = 5, # Minimum number of genes required to include a gene set
+    # abs.ranking = F,
+    parallel.sz=detectCores()#-1
+    )
+  
+  ## Save GSVA results:
+  save(list = c("gsva_res"), file = fn_pdx)
+  
+} else if (file.exists(fn_pdx) & !exists("gsva_res")){ 
+  ## Load GSVA results, if they haven't been loaded already:
+  load(fn_pdx) 
+}
+## Build data frame versions of GSVA results:
+gsva_res.df <- gsva_res %>% data.frame(gene.set=rownames(.), .) # Convert to data frame
+rownames(gsva_res.df) <- gsva_res.df$gene.set
+```
+
+We're interested in ranking the samples/cell lines based on their mesenchymal character. To do that, we'll take a look at the GSVA score distributions for several EMT-related gene sets, including the different pan-cancer EMT subsignatures (mesenchymal versus epithelial gene lists).
+
+```{r Gene sets of interest for downstream calculations}
+### Data to plot in heatmap:
+emt_sets <- c(
+  "HIF_SIGNATURE",
+  "HALLMARK_EPITHELIAL_MESENCHYMAL_TRANSITION",
+  "HALLMARK_HYPOXIA",
+  "G13_SIGNATURE",
+  names(gene_sets4),
+  "PCEMT_EPITHELIAL",
+  "PCEMT_MESENCHYMAL"
+  ) %>% 
+  unique()
+
+## Data for all RNA-seq samples:
+emt_gsva <- gsva_res.df %>%
+  filter(gene.set %in% emt_sets) %>%
+  dplyr::select(-gene.set)
+
+emt_gsva.t <- emt_gsva %>%
+  t() %>% 
+  data.frame(spl = row.names(.))
+
+## Data for just the tumor samples:
+tumor_gsva <- emt_gsva %>% 
+  dplyr::select(contains(all_of(spls.tumors$spl)))
+
+tumor_gsva.t <- emt_gsva.t %>%
+  filter(spl %in% spls.tumors$spl)
+```
+
+
+```{r Heatmap of GSVA scores}
+spls2 <- emt_gsva %>% 
+  t() %>%
+  data.frame(spl=colnames(emt_gsva)) # GSVA scores as columns in wide format
+
+annot_colors <- list(
+  PDX_line = c("PDX188"=annotcols3[1],
+               "PDX366"=annotcols3[2],
+               "PDX395"=annotcols3[3],
+               "PDX449"=annotcols3[4],
+               "PDX608"=annotcols3[5],
+               "PDX738"=annotcols3[6],
+               "None" = "White"),
+  spl_type = c("Tumor" = annotcols2[1], "Normal" = annotcols2[2], 
+               "Cells" = annotcols2[3], "Mets" = annotcols2[4]),
+  pcEMT.cc = c("1" = annotcols[1], "2" = annotcols[2]),
+  gene_sig = c("E"=annotcols[3], "M"=annotcols[4])
+  )
+
+### Draw heatmap:
+pheatmap::pheatmap(emt_gsva,
+         clustering_method = "ward.D2",
+         # color = colorRampPalette(c("darkblue","grey90","orange2"))(101),
+         # color = colorRampPalette(c("red","black","green"))(101),
+         # color = colorRampPalette(paletteer_d("RColorBrewer::BrBG", direction = -1))(101),
+         color = colorRampPalette(paletteer_d("RColorBrewer::PuOr", direction = -1))(101),
+         annotation_col = spl_annot, annotation_colors = annot_colors,
+         cutree_rows = 3, #cutree_cols = 2,
+         treeheight_row = 1, treeheight_col = 1, border_color = NA,
+         # cellwidth = 7, cellheight = 25,
+         show_colnames = T, angle_col = 90,
+         fontsize = 8,
+         main = "PDX RNA-seq: GSVA scores",
+         # file = "GSVA_PDX_heatmap.png"
+         )
+```
+
+
+## Ranking based on pcEMT signature scores
+Now that we have GSVA scores for the two pieces (epithelial and mesenchymal) of the pcEMT signature, we can rank the cell lines based on their mesenchymal character while also looking at the enrichment of the epithelial genes from the signature.
+
+```{r Rank samples using mesenchymal scores}
+## pcEMT GSVA scores:
+pcemt_gsva <- gsva_res.df %>%
+  subset(gene.set %>% str_detect("PCEMT_")) %>%
+  pivot_longer(-gene.set)
+
+## Get sample ranks based on mesenchymal scores:
+pcemt_ranks <- pcemt_gsva %>% 
+  subset(gene.set %>% str_detect("PCEMT_MES")) %>% 
+  arrange(desc(value)) %>% 
+  dplyr::pull(name) %>% 
+  factor(., levels=.)
+
+## Organize GSVA scores based on ranks:
+emt_gsva.ranked <- emt_gsva %>%
+  t() %>% data.frame() %>% 
+  arrange(desc(PCEMT_MESENCHYMAL)) %>% t()
+
+```
+
+```{r Plot ranked samples}
+###################### Heatmap of GSVA scores ######################   
+annotcols <- paletteer_d("RColorBrewer::Set1")
+annotcols2 <- c("orange","dodgerblue","limegreen","grey80")
+annotcols3 <- paletteer_d("ggthemes::Tableau_10")
+annot_colors <- list(
+  PDX_line = c("PDX188"=annotcols3[1],
+               "PDX366"=annotcols3[2],
+               "PDX395"=annotcols3[3],
+               "PDX449"=annotcols3[4],
+               "PDX608"=annotcols3[5],
+               "PDX738"=annotcols3[6],
+               "None" = "White"),
+  spl_type = c("Tumor" = annotcols2[1], "Normal" = annotcols2[2], 
+               "Cells" = annotcols2[3], "Mets" = annotcols2[4]),
+  pcEMT.cc = c("1" = annotcols[4], "2" = annotcols[3]),
+  gene_sig = c("E"=annotcols[2], "M"=annotcols[1])
+  )
+
+# pheatmap::pheatmap(emt_gsva.ranked,
+pheatmap::pheatmap(emt_gsva[,pcemt_ranks %>% as.character()],
+         cluster_cols = F, 
+         clustering_method = "ward.D2",
+         color = colorRampPalette(paletteer_d("RColorBrewer::PuOr", direction = -1))(101),
+         annotation_col = spl_annot %>% dplyr::select(-pcEMT.cc),
+         annotation_colors = annot_colors,
+         cutree_rows = 3, #cutree_cols = 2,
+         treeheight_row = 1, treeheight_col = 1, border_color = NA,
+         # cellwidth = 7, 
+         # cellheight = 20,
+         show_colnames = T, angle_col = 90,
+         fontsize = 8,
+         main = "PDX RNA-seq\nSamples ranked by pcEMT-M GSVA scores",
+         # file="pcEMT-GSVA-ranked_PDX_heatmap.png"
+         )
+
+
+
+###################### Heatmap of pcEMT genes ###################### 
+pheatmap::pheatmap(pcemt[,pcemt_ranks %>% as.character()] %>% t(),
+         scale = "column",
+         cluster_rows = F,
+         clustering_method = "ward.D2",
+         # color = colorRampPalette(c("red","black","green"))(101),
+         # color = colorRampPalette(c("dodgerblue","grey85","red"))(101),
+         # color = colorRampPalette(paletteer_d("RColorBrewer::RdBu", direction = -1))(101),
+         color = colorRampPalette(colors1)(101),
+         annotation_col = gene_annot, 
+         annotation_row = spl_annot, #%>% dplyr::select(-pcEMT.cc), 
+         annotation_colors = annot_colors,
+         show_colnames = T, angle_col = 90,
+         cutree_rows = 1, cutree_cols = 2,
+         treeheight_row = 1, treeheight_col = 1, border_color = NA,
+         # cellheight = 5,  cellwidth = 10,
+         fontsize_size = 8,
+         main = "PDX RNA-seq\npcEMT signature ordered by pcEMT-M GSVA score",
+         # file="pcEMT-ranked_PDX_heatmap.png"
+         )
+```
+
+```{r G13 signature heatmap}
+### Draw a heatmap of the G13 signature:
+colors1 <- c("#053061FF","#2166ACFF","#4393C3FF","grey85","#D6604DFF","#B2182BFF","#67001FFF") # color scheme for heatmap cells
+
+## Draw heatmap:
+pheatmap::pheatmap(g13[,pcemt_ranks %>% as.character()] %>% t(),
+         scale = "column",
+         cluster_rows = F,
+         clustering_method = "ward.D2",
+         color = colorRampPalette(colors1)(101),
+         annotation_row = spl_annot, annotation_colors = annot_colors,
+         show_rownames = T, angle_col = 90,
+         treeheight_row = 1, treeheight_col = 1, border_color = NA,
+         # cellheight = 8,  
+         cellwidth = 15, 
+         na_col = "black",
+         main = "G13 signature",
+         # file="G13-ranked_PDX_heatmap.png"
+         )
+```
+
+```{r PDX cell line samples only}
+###################### Samples with/from PDX cell lines only ###################### 
+pdx_ranks <- pcemt_ranks %>% match(spls.pdx$spl) %>% na.omit() %>% 
+  spls.pdx$spl[.]
+
+
+## GSVA scores:
+emt_gsva_pdx <- pdx_ranks %>% emt_gsva[,.]
+
+pheatmap::pheatmap(emt_gsva_pdx,
+         cluster_cols = F, 
+         clustering_method = "ward.D2",
+         color = colorRampPalette(paletteer_d("RColorBrewer::PuOr", direction = -1))(101),
+         annotation_col = spl_annot,
+         annotation_colors = annot_colors,
+         # cutree_rows = 2, cutree_cols = 2,
+         treeheight_row = 1, treeheight_col = 1, border_color = NA,
+         # cellwidth = 7, cellheight = 20,
+         show_colnames = T, angle_col = 90,
+         fontsize = 8,
+         main = "GSVA scores\nSamples ranked by pcEMT-M GSVA scores",
+         # file="pcEMT-GSVA-ranked_PDX-only_heatmap.png"
+         )
+
+## Genes:
+pcemt_pdx <- pdx_ranks %>% pcemt[,.]
+
+pheatmap::pheatmap(pcemt_pdx %>% t(),
+         scale = "column",
+         cluster_rows = F,
+         clustering_distance_cols = "canberra",
+         clustering_method = "ward.D2", 
+         color = colorRampPalette(colors1)(101),
+         annotation_col = gene_annot, 
+         annotation_row = spl_annot, 
+         annotation_colors = annot_colors,
+         show_colnames = T, angle_col = 90,
+         cutree_rows = 1, cutree_cols = 2,
+         treeheight_row = 1, treeheight_col = 1, border_color = NA,
+         # cellheight = 15,  cellwidth = 10,
+         fontsize = 8,
+         main = "pcEMT signature\nSamples ordered by pcEMT-M GSVA scores",
+         # file="pcEMT-ranked_PDX-only_heatmap.png"
+         )
+
+
+### Faceted plot based on sample type:
+## Data in long format:
+pdx_gsva.l <- emt_gsva_pdx %>%
+  mutate(gene_set = row.names(.)) %>% 
+  pivot_longer(-gene_set) %>% 
+  mutate(spl_type = match(name, spls$spl) %>% spls$spl_type[.],
+         PDX_line = match(name, spls$spl) %>% spls$PDX_line[.],
+         ) %>% 
+  # subset(gene_set %in% "PCEMT_MESENCHYMAL") %>%
+  subset(gene_set %in% "HALLMARK_EPITHELIAL_MESENCHYMAL_TRANSITION") %>%
+  group_by(spl_type) %>% 
+  arrange(desc(value), .by_group=T) %>% 
+  mutate(name = factor(name, levels=name))
+
+## The plot:
+ggplot(pdx_gsva.l, aes(x = name, y = value, fill = PDX_line, label=PDX_line)) +
+  geom_hline(yintercept = 0, col="black") +
+  geom_col(col="black") + 
+  geom_label_repel(direction="y", force=50, size = 3, min.segment.length = 0.01) + guides(fill=F) +
+  facet_wrap(~spl_type, 
+             scales = "free_x"
+             ) + 
+  scale_fill_paletteer_d("RColorBrewer::Dark2") +
+  theme_cowplot() + theme_cust(T,T,T) + 
+  theme(axis.text.x = element_text(angle=90, hjust=1, vjust =0.4)) + 
+  # labs(title = "Ranked PDX cell line samples", x="Sample", y="pcEMT-M GSVA score")
+  labs(title = "Ranked PDX cell line samples", x="Sample", y="Hallmark EMT GSVA score")
+ggsave("Ranked-PDX-only_faceted_pcEMT-M_gsva-score.png")
+
+
+### Distributions of the pcEMT subsignatures for each sample:
+## Data in long format:
+pdx_pcemt.l <- pcemt_pdx %>% mutate(gene = row.names(.)) %>% 
+  pivot_longer(-gene) %>% 
+  mutate(spl_type = match(name, spls$spl) %>% spls$spl_type[.],
+         PDX_line = match(name, spls$spl) %>% spls$PDX_line[.],
+         gene_type = match(gene, pcemt.sig$gene) %>% pcemt.sig$type[.]
+         ) %>% 
+  group_by(gene_type)
+
+## The plot:
+ggplot(pdx_pcemt.l %>% subset(gene_type %in% "M"),
+       aes(x=name, y=value, fill = spl_type %>% factor(levels=c("Tumor","Cells","Mets")))) +
+  geom_violin() +
+  facet_wrap(~PDX_line, scales = "free_x",
+             # ncol = 1
+             ) + 
+  scale_fill_manual(values = annotcols2[c(1,3,4)]) +
+  # scale_fill_paletteer_d("ggthemes::Tableau_10") +
+  theme_cowplot() + theme_cust(T,T,T) +
+  labs(x="Sample", y="Gene expression\nlog2(TPM+1)",
+       title="pcEMT-M gene expression distributions", fill = "spl_type")
+ggsave("PDX-only_pcEMT-M_violinplot.png")
+```
+
+
+## NMF clustering
+```{r NMF calculations}
+library(NMF)
+
+## Get pcEMT data for NMF: Just the tumor samples
+pcemt_nmf <- pcemt %>% data.frame(row.names=rownames(.), .) %>% 
+  dplyr::select(contains("T")) %>% 
+  data.matrix()
+  
+
+## =============== Perform NMF calculations using pcEMT signature =============== ##
+fn_nmfres <- "PDX_nmf_results.Rdata" # file path for storing NMF results
+nmf_method <- "brunet" # NMF algorithm to use
+nmf_opts <- "vp8" # verbosity/parallel options
+perform_nmf <- F # Choose whether to run NMF regardless of whether it has been done already or not
+if(!file.exists(fn_nmfres) | perform_nmf){
+  ## pcEMT NMF:
+  nmf_pcemt <- nmf(pcemt_nmf, rank=2:5, method=nmf_method, nrun=100, .opt=nmf_opts, seed=123) # check for optimal cluster number
+  nmf_pcemt2 <- nmf(pcemt_nmf, rank=2, method=nmf_method, nrun=500, .opt=nmf_opts, seed=123) # pcEMT, 2 clusters
+  nmf_pcemt3 <- nmf(pcemt_nmf, rank=3, method=nmf_method, nrun=500, .opt=nmf_opts, seed=123) # pcEMT, 3 clusters
+  nmf_pcemt4 <- nmf(pcemt_nmf, rank=4, method=nmf_method, nrun=500, .opt=nmf_opts, seed=123) # pcEMT, 4 clusters
+  
+  ## Save NMF results for speed:
+  nmfres_names <- c("nmf_pcemt","nmf_pcemt2","nmf_pcemt3","nmf_pcemt4")
+  save(list = nmfres_names, file = fn_nmfres)
+} else if(file.exists(fn_nmfres) & !exists("nmf_pcemt")){ 
+  ## Load NMF results, if they haven't been loaded already:
+  load(fn_nmfres) 
+}
+# nmf_pcemt2 <- nmf_pcemt4
+
+## Assess NMF quality metrics to determine best k:
+plot(nmf_pcemt)
+consensusmap(nmf_pcemt)
+barplot(cophenetic*dispersion~rank, nmf_pcemt$measures, main="NMF optimal factorization rank")
+
+## NMF results for best k:
+basismap(nmf_pcemt2)
+coefmap(nmf_pcemt2)
+consensusmap(nmf_pcemt2)
+
+## =============== Get pcEMT NMF clusters =============== ##
+## pcEMT, clusters from NMF mixture coefficients:
+nmf2_maxs <- coef(nmf_pcemt2) %>% apply(2, max)
+nmf2_coef <- coef(nmf_pcemt2) %>% t()
+for(i in 1:length(nmf2_maxs)){
+  nmf2_coef[i,] <- nmf2_coef[i,] == nmf2_maxs[i]
+}
+nmf2_df <- nmf2_coef %>% 
+  data.frame(spl=rownames(.), .) %>% 
+  mutate(NMF = "",
+         # NMF = replace(NMF, X1==1,"NMF1"),
+         # NMF = replace(NMF, X2==1,"NMF2"),
+         # NMF = replace(NMF, X3==1,"NMF3"),
+         # NMF = replace(NMF, X4==1,"NMF4"),
+         NMF = replace(NMF, X1==1,"M-low"),
+         NMF = replace(NMF, X2==1,"M-high"),
+         # NMF = replace(NMF, X1==1,"E+/M-"),
+         # NMF = replace(NMF, X2==1,"E-/M+"),
+         # NMF = replace(NMF, X3==1,"E-/M+"),
+         # NMF = replace(NMF, X4==1,"E+/M+"),
+         )
+
+
+## =============== Heatmaps w/ pcEMT signature and NMF clusters =============== ##
+## Get pcEMT data for heatmap:
+pcemt_phm2 <- pcemt_nmf %>% t() %>% scale()
+pcemt_df2 <- pcemt_phm2 %>% 
+  data.frame(spl=rownames(.)) %>% 
+  pivot_longer(-spl, names_to = "gene", values_to = "Expression z-score") %>% 
+  inner_join(pcemt.sig, by="gene", suffix=c("",".x")) %>% 
+    mutate(type = replace(type, type=="M","Mesenchymal"),
+           type = replace(type, type=="E","Epithelial"),
+           ) %>% 
+  dplyr::rename(pcEMT_sig=type)
+
+## Format NMF results for heatmap and joining to sample annotations:
+nmf_cc_df <- nmf2_df %>%
+  dplyr::select(contains(all_of(c("spl","NMF")))) %>% 
+  inner_join(pcemt_df2, by="spl", suffix=c("",".x")) %>% 
+  mutate(NMF = factor(NMF, levels=c("M-high","M-low")))
+  # mutate(NMF = factor(NMF, levels=c("E-/M+","E+/M+","E+/M-")))
+
+
+## Plot params and color limits/breaks:
+h <- 6
+w <- 14
+len_out <- 6
+breaks1 <- seq(-3,3,length.out=100)
+breaks2 <- seq(-3,3,length.out=len_out+1)
+colors1 <- paletteer_d("RColorBrewer::RdBu", 100, direction=-1, type="continuous")
+annotcols_nmf <- paletteer_d("RColorBrewer::Set1")[2:1]
+annotcols2_nmf <- paletteer_d("RColorBrewer::Set1")[3:4]
+# annotcols2_nmf <- paletteer_d("RColorBrewer::Set1")[c(4,5,3)]
+annotcols3_nmf <- c("orange","dodgerblue","limegreen","grey80")
+annotcols4_nmf <- paletteer_d("RColorBrewer::Dark2")[c(8,1:6)]
+
+## pcEMT, NMF clusters from  coefficients:
+nmf_pcemt_hm <-nmf_cc_df %>%
+  inner_join(spls, by="spl", suffix=c("",".x")) %>%
+  mutate(spl_type=factor(spl_type, levels=c("Tumor","Normal","Cells","Mets"))) %>% 
+  group_by(pcEMT_sig, NMF) %>% 
+  heatmap(.row=spl, .col=gene, .value=`Expression z-score`,
+        show_column_dend=F, show_row_dend=F, show_row_names=F, .scale="none",
+        cluster_columns=T, clustering_distance_columns="euclidean", clustering_method_columns="ward.D2",
+        cluster_rows=T, clustering_distance_rows="euclidean", clustering_method_rows="ward.D2",
+        palette_value=circlize::colorRamp2(breaks1, colors1), # heatmap cell colors
+        palette_grouping=list(annotcols2_nmf[2:1], annotcols_nmf), # row group colors
+        # palette_grouping=list(annotcols2_nmf, annotcols_nmf), # row group colors
+        heatmap_legend_param=list(at = breaks2),
+        column_title="PDX RNA-seq: NMF-clustered pan-cancer EMT signature (tumor samples only)", 
+        column_title_gp=gpar(fontface="bold"),
+        row_title=NULL,
+        column_names_gp=gpar(fontsize=13),
+        use_raster=T,
+        ) %>%
+  # add_tile(spl_type, palette=annotcols3_nmf[c(2,3,4,1)]) %>% 
+  add_tile(PDX_line, palette=annotcols4_nmf[c(6,1,7,2,4,5,3)])
+  # add_tile(HALLMARK_HYPOXIA, palette=viridis::viridis(100)) 
+nmf_pcemt_hm
+nmf_pcemt_hm %>% save_pdf("NMF_pcEMT_sig_coef-clusters_clustergram.pdf", height=h, width=w)
+png("NMF_pcEMT_sig_coef-clusters_clustergram.png", height=h, width=w, units="in", res=500); nmf_pcemt_hm; dev.off()
+
+
+## Add NMF cluster annotations to sample annotations:
+spls <- spls %>%
+  mutate(NMF = match(spl, nmf_cc_df$spl) %>% nmf_cc_df$NMF[.],
+         NMF = factor(NMF, levels=c("M-low","M-high")),
+         # NMF = factor(NMF, levels=c("E+/M-","E-/M+","E+/M+")),
+         )
+
+  
+```
+
+
+# Analysis of tumor differentiation and EMT status
+We are interested in determining the correlation between the molecular characterization of a tumor's mesenchymal status/state and tumor differentiation status. We will also look at correlations between stromal content as measured by Dr. Stelow at UVA and the GSVA scores for the ESTIMATE Stromal and Immune signatures.
+## All tumors
+
+```{r Collect and format phenotype data}
+## Tumor grading (histologic, pathologic, etc.) and pcEMT-M scores:
+diff_data <- clin_data %>% 
+  dplyr::select(spl,
+                contains(all_of(c("differentiation"))),
+                # contains(all_of(c("differentiation","stage"))),
+                starts_with("path_"),
+                -contains("Stelow"),
+                ) %>% 
+  mutate(
+    pcEMT.M = spl %>% match(colnames(gsva_res)) %>% gsva_res["PCEMT_MESENCHYMAL",.],
+    Hallmark_EMT = spl %>% match(colnames(gsva_res)) %>% gsva_res["HALLMARK_EPITHELIAL_MESENCHYMAL_TRANSITION",.]
+    ) 
+
+## Longer version of the data:
+diff_data.l <- diff_data %>% 
+  pivot_longer(-c(spl, pcEMT.M, Hallmark_EMT), values_to = "grade", names_to = "grading_metric") %>% 
+  mutate(
+    grade = factor(grade, levels = c("NR","well","well to poor","well to moderate",
+                                     "moderate","moderate to poor","poor",
+                                     "1 to 3","2","2 to 3","3",
+                                     "PRIMARY","MET"
+    ))
+)
+```
+
+And now we start to explore the relationships between pcEMT-M enrichment and tumor grading metrics.
+
+```{r EMT-tumor grade comparisons (old), message=F, warning=F}
+### Faceted plots for each grading metric:
+## Using pcEMT-M signature:
+ggplot(diff_data.l, aes(x=grade, y=pcEMT.M, color=pcEMT.M)) +
+  geom_boxplot(outlier.size=0) +
+  geom_quasirandom(alpha = 0.5, shape = 16, cex=1.7) +
+  facet_wrap(~grading_metric, scales = "free_x") +
+  scale_color_paletteer_c("ggthemes::Classic Red-Blue", direction = -1) +
+  theme_cowplot() + theme_cust(T,T,T) +
+  theme(axis.text.x=element_text(angle=45, hjust=1)) +
+  labs(y="pcEMT-M GSVA score", x="Grade", title="Bauer Lab PDX tumor samples")
+ggsave("Tumor-diff-grade-metrics_pcEMT-M.png", width = 6, height = 6)
+
+## Using Hallmark EMT signature:
+ggplot(diff_data.l, aes(x=grade, y=Hallmark_EMT, color=Hallmark_EMT)) +
+  geom_boxplot(outlier.size=0) +
+  geom_quasirandom(alpha = 0.5, shape = 16, cex=1.7) +
+  facet_wrap(~grading_metric, scales = "free_x") +
+  scale_color_paletteer_c("ggthemes::Classic Red-Blue", direction = -1) +
+  theme_cowplot() + theme_cust(T,T,T) +
+  theme(axis.text.x=element_text(angle=45, hjust=1)) +
+  labs(y="Hallmark EMT GSVA score", x="Grade", title="Bauer Lab PDX tumor samples")
+ggsave("Tumor-diff-grade-metrics_HallmarkEMT.png", width = 7, height = 6)
+
+
+## One-way ANOVA: Differentiation F1 (old grades)
+diff_data.l %>%
+  filter(grading_metric %>% str_detect("F1")) %>%
+  group_by(grade) %>% filter(n() > 2) %>%
+  ggbetweenstats(x=grade, y=Hallmark_EMT,
+                 plot.type = "box",
+                 point.args = list(alpha=0.7, shape=16, size=3,
+                                   position = position_quasirandom(width = 0.15, groupOnX=T)),
+                 mean.ci = T, notch = F,
+                 # type ="np", 
+                 ggtheme = theme_cowplot(12, line_size=0.8),
+                 ) +
+    scale_color_brewer(palette="Set1", direction=-1) +
+    #theme(axis.text.x = element_text(angle=60, hjust=1)) +
+    # labs(x="Differentiation F1", y="pcEMT-M GSVA score", title="Bauer Lab PDX samples") + guides(color=F)
+    labs(x="Differentiation F1", y="Hallmark EMT GSVA score", title="Bauer Lab PDX samples") + guides(color=F)
+```
+
+Now looking at the new grading data from Dr. Stelow.(Data updated on 6.21.21.)
+
+```{r EMT-tumor grade comparisons (updated Stelow), message=F, warning=F}
+## Data wrangling:
+stelow_emt <- spls_stelow %>% inner_join(emt_gsva.t, by="spl") %>% 
+  group_by(spl_id) %>% 
+  mutate(
+    F0_pct_stroma = mean(F0_pct_stroma_Stelow),
+    PDX_pct_stroma = mean(PDX_pct_stroma_Stelow),
+    F0_differentiation = getmode(F0_differentiation_Stelow),
+    PDX_differentiation = getmode(PDX_differentiation_Stelow),
+    ) %>% 
+  dplyr::select(-contains(all_of(c("_Stelow","spl_id2")))) %>% 
+  unique() %>% 
+  mutate(PDX_line = replace(PDX_line, PDX_line=="None", NA))
+
+### One-way ANOVA: Dr. Stelow differentiation (new grades)
+jitter_pos <- position_quasirandom(width = 0.15, groupOnX=T) # for setting positions of points
+w = 2.5
+h = 3
+lblsz = 2; rpldir = "x"
+rpla = 1; rplf = 50
+fntsz = 8
+
+## ============== F0 differentiation, pcEMT-M ============== ##
+type <- "np"
+if (type=="np") {file_end <- "MannWhitneyU_"} else {file_end <- ""}
+stelow_emt %>% 
+  ggbetweenstats(x=F0_differentiation, y=PCEMT_MESENCHYMAL,
+                 plot.type = "box",
+                 violin.args=list(size=1),
+                 point.args = list(alpha=1, shape=16, size=2, position = jitter_pos),
+                 centrality.plotting=F,
+                 type = type,
+                 ggtheme = theme_cowplot(fntsz, line_size=0.5, rel_small=1, rel_tiny=1, rel_large=1),
+                 ggplot.component = list( # extra ggplot geoms
+                   geom_boxplot(fill=NA, size=1, alpha=0.3, width=0.3, outlier.alpha=0),
+                   # Label the tumors with associated PDX cell lines:
+                   geom_label_repel(aes(label=.$PDX_line, fill=.$PDX_line), alpha=rpla, force=rplf,
+                                    min.segment.length = 0, size=lblsz, position=jitter_pos, direction=rpldir
+                                    )
+                   )
+                 ) +
+    scale_color_brewer(palette="Set1", direction=-1) +
+    scale_fill_brewer(palette="Dark2") +
+    #theme(axis.text.x = element_text(angle=60, hjust=1)) +
+    labs(x="F0 differentiation", y="pcEMT-M enrichment score", title="Bauer Lab PDX RNA-seq samples") +
+    guides(color=F)
+ggsave(paste("F0_differentiation-pcEMT_comp_",file_end,"Stelow.png",sep=""), width=w, height=h)
+ggsave(paste("F0_differentiation-pcEMT_comp_",file_end,"Stelow.pdf",sep=""), width=w, height=h)
+
+## ============== F0 differentiation, Hallmark EMT ============== ##
+type <- "np"
+if (type=="np") {file_end <- "MannWhitneyU_"} else {file_end <- ""}
+stelow_emt %>% 
+  ggbetweenstats(x=F0_differentiation, y=HALLMARK_EPITHELIAL_MESENCHYMAL_TRANSITION,
+                 plot.type = "box",
+                 violin.args=list(size=1),
+                 point.args = list(alpha=1, shape=16, size=3, position = jitter_pos),
+                 centrality.plotting=F,
+                 type = type,
+                 ggtheme = theme_cowplot(fntsz, line_size=0.5, rel_small=1, rel_tiny=1, rel_large=1),
+                 ggplot.component = list( # extra ggplot geoms
+                   geom_boxplot(fill=NA, size=1, alpha=0.3, width=0.3, outlier.alpha=0),
+                   # Label the tumors with associated PDX cell lines:
+                   geom_label_repel(aes(label=.$PDX_line, fill=.$PDX_line), alpha=rpla, force=rplf,
+                                    min.segment.length = 0, size=lblsz, position=jitter_pos, direction=rpldir
+                                    )
+                   )
+                 ) +
+    scale_color_brewer(palette="Set1", direction=-1) +
+    scale_fill_brewer(palette="Dark2") +
+    #theme(axis.text.x = element_text(angle=60, hjust=1)) +
+    labs(x="F0 differentiation", y="Hallmark EMT enrichment score", title="Bauer Lab RNA-seq samples") + guides(color=F)
+ggsave(paste("F0_differentiation-HallEMT_comp_",file_end,"Stelow.png",sep=""), width=w, height=h)
+ggsave(paste("F0_differentiation-HallEMT_comp_",file_end,"Stelow.pdf",sep=""), width=w, height=h)
+
+
+## ============== PDX tumor differentiation, pcEMT-M ============== ##
+stelow_emt %>% 
+  ggbetweenstats(x=PDX_differentiation, y=PCEMT_MESENCHYMAL,
+                 plot.type = "box",
+                 violin.args=list(size=1),
+                 point.args = list(alpha=1, shape=16, size=3, position = jitter_pos),
+                 centrality.plotting=F,
+                 type = type,
+                 ggtheme = theme_cowplot(fntsz, line_size=0.5, rel_small=1, rel_tiny=1, rel_large=1),
+                 ggplot.component = list( # extra ggplot geoms
+                   geom_boxplot(fill=NA, size=1, alpha=0.3, width=0.3, outlier.alpha=0),
+                   # Label the tumors with associated PDX cell lines:
+                   geom_label_repel(aes(label=.$PDX_line, fill=.$PDX_line), alpha=rpla, force=rplf,
+                                    min.segment.length = 0, size=lblsz, position=jitter_pos, direction=rpldir
+                                    )
+                   )
+                 ) +
+    scale_color_brewer(palette="Set1", direction=-1) +
+    scale_fill_brewer(palette="Dark2") +
+    #theme(axis.text.x = element_text(angle=60, hjust=1)) +
+    labs(x="PDX differentiation", y="pcEMT-M enrichment score", title="Bauer Lab RNA-seq samples") + guides(color=F)
+ggsave(paste("PDX_differentiation-pcEMT_comp_",file_end,"Stelow.png",sep=""), width=w, height=h)
+ggsave(paste("PDX_differentiation-pcEMT_comp_",file_end,"Stelow.pdf",sep=""), width=w, height=h)
+
+
+## ============== PDX tumor differentiation, Hallmark EMT ============== ##
+stelow_emt %>% 
+  ggbetweenstats(x=PDX_differentiation, y=HALLMARK_EPITHELIAL_MESENCHYMAL_TRANSITION,
+                 plot.type = "box",
+                 violin.args=list(size=1),
+                 point.args = list(alpha=1, shape=16, size=3, position = jitter_pos),
+                 centrality.plotting=F,
+                 type = type,
+                 ggtheme = theme_cowplot(fntsz, line_size=0.5, rel_small=1, rel_tiny=1, rel_large=1),
+                 ggplot.component = list( # extra ggplot geoms
+                   geom_boxplot(fill=NA, size=1, alpha=0.3, width=0.3, outlier.alpha=0),
+                   # Label the tumors with associated PDX cell lines:
+                   geom_label_repel(aes(label=.$PDX_line, fill=.$PDX_line), alpha=rpla, force=rplf,
+                                    min.segment.length = 0, size=lblsz, position=jitter_pos, direction=rpldir
+                                    )
+                   )
+                 ) +
+    scale_color_brewer(palette="Set1", direction=-1) +
+    scale_fill_brewer(palette="Dark2") +
+    #theme(axis.text.x = element_text(angle=60, hjust=1)) +
+    labs(x="PDX differentiation", y="Hallmark EMT enrichment score", title="Bauer Lab RNA-seq samples") +
+    guides(color=F)
+ggsave(paste("PDX_differentiation-HallEMT_comp_",file_end,"Stelow.png",sep=""), width=w, height=h)
+ggsave(paste("PDX_differentiation-HallEMT_comp_",file_end,"Stelow.pdf",sep=""), width=w, height=h)
+```
+
+
+## Only tumors with unchanged F0-PDX/F1 grades (updated Stelow grading)
+```{r Differentiation analysis, message=F, warning=F}
+### One-way ANOVA: Dr. Stelow differentiation (new grades)
+stelow_emt2 <- stelow_emt %>% filter(F0_differentiation==PDX_differentiation) # filter for F0_diff=PDX_diff
+jitter_pos <- position_quasirandom(width = 0.15, groupOnX=T) # for setting positions of points
+w = 3.1
+h = 4
+lblsz = 2.5; rpldir = "x"
+rpla = 1; rplf = 50
+fntsz = 12
+
+## Welch's t-test:
+stelow_emt2 %>% 
+  # ggbetweenstats(x=F0_differentiation, y=PCEMT_MESENCHYMAL,
+  ggbetweenstats(x=F0_differentiation, y=HALLMARK_EPITHELIAL_MESENCHYMAL_TRANSITION,
+                 plot.type = "box",
+                 violin.args=list(size=1),
+                 point.args = list(alpha=1, shape=16, size=3, position = jitter_pos),
+                 centrality.plotting=F,
+                 type = "p",
+                 ggtheme = theme_cowplot(fntsz, line_size=0.8, rel_small=1, rel_tiny=1, rel_large=1),
+                 ggplot.component = list( # extra ggplot geoms
+                   geom_boxplot(fill=NA, size=1, alpha=0.3, width=0.3, outlier.alpha=0),
+                   # Label the tumors with associated PDX cell lines:
+                   geom_label_repel(aes(label=.$PDX_line, fill=.$PDX_line), alpha=rpla, force=rplf,
+                                    min.segment.length = 0, size=lblsz, position=jitter_pos, direction=rpldir
+                                    )
+                   )
+                 ) +
+    scale_color_brewer(palette="Set1", direction=-1) +
+    scale_fill_brewer(palette="Dark2") +
+    #theme(axis.text.x = element_text(angle=60, hjust=1)) +
+    # labs(x="F0 differentiation (Stelow)", y="pcEMT-M GSVA score", title="Bauer Lab RNA-seq samples: F0=F1/PDX") + guides(color=F)
+    labs(x="F0 differentiation (Stelow)", y="Hallmark EMT GSVA score", title="Bauer Lab RNA-seq samples: F0=F1/PDX") + guides(color=F)
+# ggsave("F0=F1_differentiation-pcEMT_comp_Stelow.png", width=w, height=h)
+ggsave("F0=F1_differentiation-HallEMT_comp_Stelow.png", width=w, height=h)
+
+
+### Mann-Whitney U test:
+## =============== pcEMT-M ============== ##
+stelow_emt2 %>% 
+  ggbetweenstats(x=F0_differentiation, y=PCEMT_MESENCHYMAL,
+                 plot.type = "box",
+                 violin.args=list(size=1),
+                 point.args = list(alpha=1, shape=16, size=3, position = jitter_pos),
+                 centrality.plotting=F,
+                 type = "np",
+                 ggtheme = theme_cowplot(fntsz, line_size=0.8, rel_small=1, rel_tiny=1, rel_large=1),
+                 ggplot.component = list( # extra ggplot geoms
+                   geom_boxplot(fill=NA, size=1, alpha=0.3, width=0.3, outlier.alpha=0),
+                   # Label the tumors with associated PDX cell lines:
+                   geom_label_repel(aes(label=.$PDX_line, fill=.$PDX_line), alpha=rpla, force=rplf,
+                                    min.segment.length = 0, size=lblsz, position=jitter_pos, direction=rpldir
+                                    )
+                   )
+                 ) +
+    scale_color_brewer(palette="Set1", direction=-1) +
+    scale_fill_brewer(palette="Dark2") +
+    #theme(axis.text.x = element_text(angle=60, hjust=1)) +
+    labs(x="F0 differentiation (Stelow)", y="pcEMT-M GSVA score", title="Bauer Lab RNA-seq samples: F0=F1/PDX") + guides(color=F)
+ggsave("F0=F1_differentiation-pcEMT_comp_MannWhitneyU_Stelow.png", width=w, height=h)
+
+
+## =============== Hallmark EMT ============== ##
+stelow_emt2 %>% 
+  ggbetweenstats(x=F0_differentiation, y=HALLMARK_EPITHELIAL_MESENCHYMAL_TRANSITION,
+                 plot.type = "box",
+                 violin.args=list(size=1),
+                 point.args = list(alpha=1, shape=16, size=3, position = jitter_pos),
+                 centrality.plotting=F,
+                 type = "np",
+                 ggtheme = theme_cowplot(fntsz, line_size=0.8, rel_small=1, rel_tiny=1, rel_large=1),
+                 ggplot.component = list( # extra ggplot geoms
+                   geom_boxplot(fill=NA, size=1, alpha=0.3, width=0.3, outlier.alpha=0),
+                   # Label the tumors with associated PDX cell lines:
+                   geom_label_repel(aes(label=.$PDX_line, fill=.$PDX_line), alpha=rpla, force=rplf,
+                                    min.segment.length = 0, size=lblsz, position=jitter_pos, direction=rpldir
+                                    )
+                   )
+                 ) +
+    scale_color_brewer(palette="Set1", direction=-1) +
+    scale_fill_brewer(palette="Dark2") +
+    #theme(axis.text.x = element_text(angle=60, hjust=1)) +
+    labs(x="F0 differentiation (Stelow)", y="Hallmark EMT GSVA score", title="Bauer Lab RNA-seq samples: F0=F1/PDX") + guides(color=F)
+ggsave("F0=F1_differentiation-HallEMT_comp_MannWhitneyU_Stelow.png", width=w, height=h)
+
+```
+
+
+## DEA, ORA, DEnA, and DGCA calculations
+Now we perform differential expression analysis (DEA) to see if any EMT-related genes are at the top of the list of differentially expressed genes between the two main types of tumor differentiation groups.
+```{r DEA, message=F, warning=F}
+############### DEA with limma ###############
+library(limma)
+## Define statistical threshold:
+adjPvalueCutoff1 <- 0.05 # Threshold for adjusted p-values for GSVA ES DEnA
+lfc_cut1 <- 1
+
+## Define design matrix:
+use_F0_or_F1 <- "F0=F1"
+if(use_F0_or_F1=="F0"){
+  design1 <- model.matrix(~0 + stelow_emt$F0_differentiation)
+  rownames(design1) <- stelow_emt$spl
+  colnames(design1) <- stelow_emt$F0_differentiation %>% unique()
+  plt_title = "(F0)"
+} else if(str_detect(use_F0_or_F1,"^F1$|^PDX$")) {
+  design1 <- model.matrix(~0 + stelow_emt$PDX_differentiation)
+  rownames(design1) <- stelow_emt$spl
+  colnames(design1) <- stelow_emt$PDX_differentiation %>% unique()
+  plt_title = "(PDX)"
+} else if(str_detect(use_F0_or_F1, "F0=F1|F0=PDX|F1=F0|PDX=F0")) {
+  design1 <- model.matrix(~0 + stelow_emt2$F0_differentiation)
+  rownames(design1) <- stelow_emt2$spl
+  colnames(design1) <- stelow_emt2$F0_differentiation %>% unique()
+  plt_title = "(F0=F1)"
+}
+
+
+## Perform DEA:
+fit1 <- lmFit(logtpm_symbol[,rownames(design1)], design1)
+contr1 <- makeContrasts(POORvsMOD = Poorly - Moderately, # Make contrasts --> compare groups of interest
+                        levels = colnames(design1))
+tmp1 <- contrasts.fit(fit1, contr1)
+tmp1 <- eBayes(tmp1)
+allGenes <- topTable(tmp1, sort.by = "P", number=Inf) %>% 
+  mutate(ID = rownames(.)) %>% 
+  mutate(
+         HallEMT = (ID %in% hallemt_sig) %>% as.numeric() %>% add(1) %>% c("","HallEMT")[.],
+         pcEMT =(ID %in% pcemt.sig.m$gene) %>% as.numeric() %>% add(1) %>% c("","pcEMT")[.],
+         EMT_geneset = paste(HallEMT,pcEMT,sep=""),
+         EMT_geneset = replace(EMT_geneset, EMT_geneset=="", NA),
+         EMT_geneset = replace(EMT_geneset, EMT_geneset=="HallEMTpcEMT", "Both")
+         )
+DEGenes <- topTable(tmp1, sort.by = "P", number=Inf,
+ p.value=adjPvalueCutoff1, adjust="BH")
+res1 <- decideTests(tmp1, p.value=adjPvalueCutoff1)
+summary(res1)
+DEGenes
+
+
+############### Plot the results ############### 
+txtsz <- 12
+lbltxtsz <- 2.5
+linesz <- 1
+volcw <- 6
+volch <- 4.5
+label_order <- c("HallEMT","pcEMT","Both")
+
+## Volcano with Hallmark EMT genes highlighted:
+ggplot(allGenes, aes(x=logFC, y=-log10(P.Value), label=ID, color=(P.Value<adjPvalueCutoff1 & abs(logFC)>lfc_cut1))) +
+  geom_vline(xintercept = lfc_cut1, col="black", linetype = "dashed", alpha = 0.5, size = linesz/2) +
+  geom_vline(xintercept = -lfc_cut1, col="black", linetype = "dashed", alpha = 0.5, size = linesz/2) +
+  geom_hline(yintercept = -log10(adjPvalueCutoff1),
+    color = "black", linetype = "dashed", alpha = 0.5, size = linesz/2
+  ) + 
+  geom_point(alpha=0.5) +
+  # geom_label_repel(data=function(x){x %>% filter(P.Value<adjPvalueCutoff1 & abs(logFC)>lfc_cut1)},
+  # geom_label_repel(data=function(x){x %>% filter(P.Value<adjPvalueCutoff1 & abs(logFC)>lfc_cut1 & ID %in% hallemt_sig)},
+  geom_label_repel(data=function(x){x %>% filter(P.Value<adjPvalueCutoff1 & abs(logFC)>lfc_cut1 & !is.na(EMT_geneset))},
+                  # aes(color=ID %in% hallemt_sig),
+                  aes(fill=EMT_geneset),
+                  color="black",
+                  size = lbltxtsz, segment.size = 0.5, segment.alpha = 0.7, min.segment.length = 0, max.overlaps = 100) + 
+  scale_color_manual(values=c("grey50","red")) +
+  # scale_fill_paletteer_d("colorblindr::OkabeIto") +
+  scale_fill_manual(limits=label_order, values=julia_cols, na.value="grey80") + 
+  theme_cowplot(txtsz+2, line_size = linesz) + theme_cust(T,T,T, lnsz = linesz) +
+  theme(legend.position="bottom") +
+  # labs(title = paste("DEA: Poorly vs. moderately differentiated",plt_title,"\n(Hallmark EMT genes highlighted)"),
+  labs(title = paste("DEA: Poorly vs. moderately differentiated",plt_title),
+       x = "log2FC") + guides(color=F)
+ggsave(paste("DEA-volcano_HallEMT_tumor-differentiation_",use_F0_or_F1,".png",sep=""), height=volch, width=volcw)
+  
+
+
+## Barplots of top differentially expressed genes:
+n_top <- 50 # number of top differentially expressed genes (in "Poorly" vs. "Moderately" tumors) to view
+allGenes %>%
+  arrange(desc(logFC)) %>%
+  filter(P.Value<adjPvalueCutoff1) %>% 
+  # slice_tail(n=n_top) %>% 
+  slice_head(n=n_top) %>% 
+  mutate(ID = factor(ID,levels=ID)) %>% 
+  ggplot(aes(x=ID, y=logFC, 
+             fill=EMT_geneset,
+             # fill=ID %in% hallemt_sig,
+             # fill=ID %in% pcemt.sig.m$gene,
+             # fill=-log10(P.Value),
+             )) +
+    geom_col() +
+    # scale_fill_manual(values=c("grey80","dodgerblue")) + 
+    scale_fill_manual(limits=label_order, values=julia_cols, na.value="grey80") + 
+    # scale_fill_viridis_c(option="inferno") +
+    theme_minimal_grid(txtsz) + 
+    theme(axis.text.x=element_text(angle=90, hjust=1, vjust=0.4),
+          legend.position="bottom") +
+    labs(title = paste("DEA: Poorly vs. moderately differentiated",plt_title,
+                       "\nTop",as.character(n_top),"differentially expressed genes"), 
+         x="", fill="In Hallmark EMT?") + guides(color=F)
+ggsave(paste("DEA-barplot_HallEMT_top-",as.character(n_top),"-genes_tumor-differentiation_",
+             use_F0_or_F1,".png",sep=""), 
+       # height=7, width=5.7)
+       height=3, width=8)
+```
+
+With the top differentially upregulated genes in poorly versus moderately differentiated tumors, we now turn to over-representation analysis to determine which gene sets are over-represented in the list of the top expressed genes in poorly versus moderately expressed genes.
+
+```{r ORA, message=F, warning=F}
+library(clusterProfiler)
+## Top differentially expressed genes in poorly differentiated tumors (see above cell for which set of tumor grades was used):
+n_top <- 100 # number of top differentially expressed genes (in "Poorly" vs. "Moderately" tumors) to view
+genes_ora <- allGenes %>%
+  arrange(desc(logFC)) %>%
+  filter(P.Value<adjPvalueCutoff1) %>%
+  filter(logFC >= 1) %>% 
+  slice_head(n=n_top) %>%
+  pull(ID) %>% 
+  mapIds(org.Hs.eg.db, ., 'ENTREZID', 'SYMBOL')
+
+universe <- rownames(logtpm_symbol) %>% mapIds(org.Hs.eg.db, ., 'ENTREZID', 'SYMBOL')
+
+
+## ==================== Over-representation analyses ==================== ##
+alpha <- 0.05 # significance threshold
+txtsz <- 6 # Text size for plots
+num_cats <- 20
+
+## GO biological process:
+gobp_ora <- enrichGO(gene = genes_ora,
+                        universe = universe,
+                        OrgDb = org.Hs.eg.db, ont = "BP", pAdjustMethod = "BH", pvalueCutoff = alpha,
+                        qvalueCutoff = alpha, readable = TRUE)
+
+
+## GO cellular component:
+gocc_ora <- enrichGO(gene = genes_ora,
+                        universe = universe,
+                        OrgDb = org.Hs.eg.db, ont = "CC", pAdjustMethod = "BH", pvalueCutoff = alpha,
+                        qvalueCutoff = alpha, readable = TRUE)
+
+
+## GO molecular function:
+gomf_ora <- enrichGO(gene = genes_ora,
+                        universe = universe,
+                        OrgDb = org.Hs.eg.db, ont = "MF", pAdjustMethod = "BH", pvalueCutoff = alpha,
+                        qvalueCutoff = alpha, readable = TRUE)
+
+
+# ## KEGG:
+# kegg_ora <- enrichKEGG(gene = genes_ora,
+#                        universe = universe,
+#                        organism = "hsa", keyType = "kegg", pAdjustMethod = "BH", pvalueCutoff = alpha, 
+#                        qvalueCutoff = alpha,
+#                        )
+
+
+## All CP gene sets:
+cp_ora <- enricher(genes_ora,
+                   universe = universe,
+                   pAdjustMethod = "BH", pvalueCutoff = alpha, TERM2GENE = hall %>% select(gs_name, entrez_gene))
+                   # pAdjustMethod = "BH", pvalueCutoff = alpha, TERM2GENE = rbind(cp_all, hall) %>% select(gs_name, entrez_gene))
+```
+
+
+```{r Plotting ORA results, message=F, warning=F}
+## GO biological process:
+p1 <- dotplot(gobp_ora, 
+        # font.size = 8,
+        showCategory = num_cats) +
+  geom_segment(aes(xend=0, yend = Description), size = 1) +
+  # geom_label_repel(aes(label = Description, point.size = Count),
+  #                    size = txtsz/2, color = "black", min.segment.length = 0, direction = "x"   
+  #                    ) +  
+  # theme_cowplot(txtsz*2, line_size = 1) +  background_grid() + #cust.theme(ticks = T, axis = "y", lnsz = 1) +
+  labs(size = "Gene count", x = "Gene Ratio", title = "GO BP over-representation")
+
+
+## GO cellular component:
+p2 <- dotplot(gocc_ora, 
+        # font.size = 8,
+        showCategory = num_cats) +
+  geom_segment(aes(xend=0, yend = Description), size = 1) +
+  # geom_label_repel(aes(label = Description, point.size = Count),   
+  #                    size = txtsz/2, color = "black", min.segment.length = 0, direction = "x"   
+  #                    ) +  
+  labs(size = "Gene count", x = "Gene Ratio", title = "GO CC over-representation")
+
+
+## GO molecular function:
+p3 <- dotplot(gomf_ora, 
+        # font.size = 8,
+        showCategory = num_cats) +
+  geom_segment(aes(xend=0, yend = Description), size = 1) +
+  # geom_label_repel(aes(label = Description, point.size = Count),  
+  #                    size = txtsz/2, color = "black", min.segment.length = 0, direction = "x"    
+  #                    ) +  
+  labs(size = "Gene count", x = "Gene Ratio", title = "GO MF over-representation")
+
+
+# ## KEGG:
+# p4 <- dotplot(kegg_ora,
+#         # font.size = 8,
+#         showCategory = num_cats) +
+#   geom_segment(aes(xend=0, yend = Description), size = 1) +
+#   # geom_label_repel(aes(label = Description, point.size = Count),
+#   #                    size = txtsz/2, color = "black", min.segment.length = 0, direction = "x"
+#   #                    ) +
+#   labs(size = "Gene count", x = "Gene Ratio", title = "KEGG over-representation")
+
+
+## Hallmark/CP collections:
+p5 <- dotplot(cp_ora, 
+        # font.size = 8,
+        showCategory = num_cats) +
+  geom_segment(aes(xend=0, yend = Description), size = 1) +
+  # geom_label_repel(aes(label = Description, point.size = Count), 
+  #                    size = txtsz/2, color = "black", min.segment.length = 0, direction = "x"   
+  #                    ) +   
+  labs(size = "Gene count", x = "Gene Ratio", 
+       title = paste("Over-representation analysis: Hallmark gene sets\nTop ",n_top,
+                     " upregulated genes in poorly differentiated tumors\n(",use_F0_or_F1,")",sep="")
+       )
+
+## Collect and display plots:
+go_grid <- plot_grid(p1, p2, p3) # show GO ORA dotplots
+show(go_grid)
+# show(p4)
+show(p5)
+
+## Save plots to disk:
+ggsave(paste("ORA_",use_F0_or_F1,"_GO-collections_dotplot.png",sep=""), go_grid, height=8, width=15)
+ggsave(paste("ORA_",use_F0_or_F1,"_Hallmark_dotplot.png",sep=""), p5, height=4, width=10)
+```
+
+
+
+And now we perform differential ENRICHMENT analysis using gene set GSVA scores in place of gene expression data.
+```{r DEnA, warning=F, message=F}
+#### DEnA with limma: GSVA scores ##################################################
+## Define statistical threshold:
+adjPvalueCutoff2 <- 0.05 # Threshold for adjusted p-values for GSVA ES DEnA
+
+## Define design matrix:
+use_F0_or_F1_2 <- "F0"
+if(use_F0_or_F1_2=="F0"){
+  design2 <- model.matrix(~ 0 + stelow_emt$F0_differentiation)
+  rownames(design2) <- stelow_emt$spl
+  colnames(design2) <- stelow_emt$F0_differentiation %>% unique()
+  plt_title2 = "(F0)"
+} else if(str_detect(use_F0_or_F1_2,"^F1$|^PDX$")) {
+  design2 <- model.matrix(~ 0 + stelow_emt$PDX_differentiation)
+  rownames(design2) <- stelow_emt$spl
+  colnames(design2) <- stelow_emt$PDX_differentiation %>% unique()
+  plt_title2 = "(PDX)"
+} else if(str_detect(use_F0_or_F1_2, "F0=F1|F0=PDX|F1=F0|PDX=F0")) {
+  use_F0_or_F1_2=="F0=F1"
+  design2 <- model.matrix(~ 0 + stelow_emt2$F0_differentiation)
+  rownames(design2) <- stelow_emt2$spl
+  colnames(design2) <- stelow_emt2$F0_differentiation %>% unique()
+  plt_title2 = "(F0=F1)"
+}
+
+
+## Perform DEnA:
+fit2 <- lmFit(gsva_res[,rownames(design2)], design2)
+contr2 <- makeContrasts(POORvsMOD = Poorly - Moderately, # Make contrasts --> compare groups of interest
+                        levels = colnames(design2))
+tmp2 <- contrasts.fit(fit2, contr2)
+tmp2 <- eBayes(tmp2)
+allGeneSets <- topTable(tmp2, sort.by = "P", number=Inf)
+allGeneSets$ID <- rownames(allGeneSets)
+allGeneSets %<>% mutate(collection = sub("\\_.*", "", ID))
+DEgeneSets <- topTable(tmp2, sort.by = "P", number=Inf,
+ p.value=adjPvalueCutoff2, adjust="fdr")
+res2 <- decideTests(tmp2, p.value=adjPvalueCutoff2)
+summary(res2)
+DEgeneSets
+
+hall_sets <- allGeneSets %>% filter(str_detect(ID,"HALLMARK"))
+print(hall_sets)
+
+
+############### Plot the results ############### 
+txtsz <- 12
+lbltxtsz <- 2.5
+linesz <- 1
+volcw <- 6.1
+volch <- 4
+
+## Volcano with Hallmark EMT genes highlighted:
+allGeneSets %>% 
+  filter(str_detect(ID,"HALLMARK")) %>% 
+  ggplot(aes(x=logFC, y=-log10(P.Value), label=ID, 
+             color=P.Value<adjPvalueCutoff2
+             )
+         ) +
+    geom_hline(yintercept = -log10(adjPvalueCutoff2),
+      color = "black", linetype = "dashed", alpha = 0.5, size = linesz/2
+    ) + 
+    geom_point(alpha=0.5) +
+    geom_text_repel(
+      data=function(x){x %>% filter(P.Value<adjPvalueCutoff2)},
+      # aes(color=P.Value<adjPvalueCutoff2),
+      color="black", force=1,
+      size = lbltxtsz, segment.size = 0.5, segment.alpha = 0.7, min.segment.length = 0, max.overlaps = 50) + 
+    scale_color_manual(values=c("grey50","red")) +
+    theme_cowplot(txtsz+2, line_size = linesz) + theme_cust(T,T,T, lnsz = linesz) +
+    labs(title = paste("DEnA: Poorly vs. moderately differentiated",plt_title2), x = "log2FC") +
+    guides(color=F)
+ggsave(paste("DEnA-volcano_tumor-differentiation_",use_F0_or_F1_2,".png",sep=""), height=volch, width=volcw)
+
+
+## Barplot of top-enriched gene sets:
+allGeneSets %>% 
+  filter(str_detect(ID,"HALLMARK")) %>% 
+  filter(P.Value < adjPvalueCutoff2) %>% # filter based on p-value
+  arrange(logFC) %>% mutate(ID=factor(ID, levels=ID)) %>% 
+  ggplot(aes(y=ID, x=logFC, fill=-log10(P.Value))) +
+    geom_col(color="black") +
+    scale_fill_viridis_c(option="inferno",
+                         # limits=-log10(c(max(hall_sets$P.Value), min(hall_sets$P.Value)))
+                         ) +
+    theme_minimal_grid(txtsz) + #theme_cust(legend.position = "bottom") +
+    labs(title = paste("DEnA: Poorly vs. moderately differentiated",plt_title2), y="")
+# ggsave(paste("DEnA-barplot_tumor-differentiation_",use_F0_or_F1_2,".png",sep=""), height=8, width=9.0) # for F1
+ggsave(paste("DEnA-barplot_tumor-differentiation_",use_F0_or_F1_2,".png",sep=""), height=3, width=9.0) # for F0
+```
+
+Next we perform differential gene correlation analysis ([DGCA](https://doi.org/10.1186/s12918-016-0349-1)) to determine whether there are modules of correlated genes when comparing between poorly and moderately differentiated tumors. Specifically, we're interested in whether there are differences in correlation between EMT-related genes and hypoxia-related genes across the different tumor differentiation groups.
+```{r DGCA, message=F, warning=F}
+library(DGCA)
+
+tumor_type <- c("F0","F1","F0=F1")
+mean_zscorediffs <- c()
+for(i in 1:length(tumor_type)){
+  ## =============== DGCA calculations =============== ##
+  ## Define design matrix:
+  # use_F0_or_F1_3 <- "F1"
+  use_F0_or_F1_3 <- tumor_type[i]
+    if(use_F0_or_F1_3=="F0"){
+      design3 <- model.matrix(~ 0 + stelow_emt$F0_differentiation)
+      rownames(design3) <- stelow_emt$spl
+      colnames(design3) <- stelow_emt$F0_differentiation %>% unique()
+      plt_title3 = "(F0)"
+    } else if(str_detect(use_F0_or_F1_3,"^F1$|^PDX$")) {
+      design3 <- model.matrix(~ 0 + stelow_emt$PDX_differentiation)
+      rownames(design3) <- stelow_emt$spl
+      colnames(design3) <- stelow_emt$PDX_differentiation %>% unique()
+      plt_title3 = "(PDX)"
+    } else if(str_detect(use_F0_or_F1_3, "F0=F1|F0=PDX|F1=F0|PDX=F0")) {
+      use_F0_or_F1_3=="F0=F1"
+      design3 <- model.matrix(~ 0 + stelow_emt2$F0_differentiation)
+      rownames(design3) <- stelow_emt2$spl
+      colnames(design3) <- stelow_emt2$F0_differentiation %>% unique()
+      plt_title3 = "(F0=F1)"
+    }
+  
+  
+  ## Select and/or filter gene expression data to use for DGCA:
+  emt_hyp_genes <- c(pcemt.sig.m$gene, hallemt_sig, hallhyp_sig, hif.sig)
+  dgca_data <- logtpm_symbol[emt_hyp_genes,rownames(design3)] %>% 
+    na.omit() %>% 
+    unique() #%>% 
+    # filterGenes(
+    #   filterTypes = "central", filterCentralPercentile = 0.75
+    #   )
+  
+  
+  ## DGCA calculation:
+  # cor_res <- getCors(inputMat = dgca_data, design = design3) 
+  # dcPairs_res <- pairwiseDCor(cor_res, compare = c("Moderately","Poorly"))
+  # ddcor_res <- dcTopPairs(dcPairs_res, compare = c("Moderately","Poorly"),
+  #                         adjust="BH", classify = TRUE)
+  # 
+  # ddMEGENA_res <- ddMEGENA(ddcor_res) # MEGENA module analysis
+  # 
+  # ddcorGO_res <- ddcorGO(ddcor_res, universe = rownames(dgca_data),
+  #                        gene_ontology = "all",
+  #                        HGNC_clean = TRUE, HGNC_switch = TRUE,
+  #                        annotation = "org.Hs.eg.db", calculateVariance = TRUE)
+  
+  ddcor_res <- ddcorAll(inputMat=dgca_data, design=design3,
+                        compare=c("Moderately","Poorly"),
+                        adjust="BH", nPerm=0, heatmapPlot=F,
+                        )
+  # head(ddcor_res)
+  
+  ddcor_res2 <- ddcor_res %>%
+    mutate(Pair=paste(Gene1, Gene2, sep="_")) %>% 
+    mutate(
+         Gene1_HallHyp = str_detect(Gene1,paste(hallhyp_sig,collapse="|")),
+         Gene1_HIFsig = str_detect(Gene1,paste(hif.sig,collapse="|")),
+         Gene1_HallEMT = str_detect(Gene1,paste(hallemt_sig,collapse="|")),
+         Gene1_pcEMT =str_detect(Gene1,paste(pcemt.sig.m$gene,collapse="|")),
+         Gene1_EMT = NA,
+         # Gene1_EMT = replace(Gene1_EMT, Gene1_HallHyp, "Hallmark_Hypoxia"),
+         Gene1_EMT = replace(Gene1_EMT, Gene1_HallEMT, "Hallmark_EMT"),
+         Gene1_EMT = replace(Gene1_EMT, Gene1_pcEMT, "pcEMT"),
+         Gene1_EMT = replace(Gene1_EMT, Gene1_HallEMT & Gene1_pcEMT, "Both")
+         ) %>% 
+      mutate(
+         Gene2_HallHyp = str_detect(Gene2,paste(hallhyp_sig,collapse="|")),
+         Gene2_HIFsig = str_detect(Gene2,paste(hif.sig,collapse="|")),
+         Gene2_HallEMT = str_detect(Gene2,paste(hallemt_sig,collapse="|")),
+         Gene2_pcEMT =str_detect(Gene2,paste(pcemt.sig.m$gene,collapse="|")),
+         Gene2_EMT = NA,
+         # Gene2_EMT = replace(Gene2_EMT, Gene2_HallHyp, "Hallmark_Hypoxia"),
+         Gene2_EMT = replace(Gene2_EMT, Gene2_HallEMT, "Hallmark_EMT"),
+         Gene2_EMT = replace(Gene2_EMT, Gene2_pcEMT, "pcEMT"),
+         Gene2_EMT = replace(Gene2_EMT, Gene2_HallEMT & Gene2_pcEMT, "Both")
+         )
+  
+  ## =============== Plot DGCA results =============== ##
+  ## Filter data for plotting:
+  alpha <- 0.05
+  ddcor_res3 <- ddcor_res2 %>% 
+    filter(Gene1_HallEMT & Gene1_pcEMT & !Gene1_HallHyp & !Gene1_HIFsig & !Gene2_HallEMT & !Gene2_pcEMT) %>% 
+    filter(pValDiff_adj < alpha) %>% 
+    arrange(desc(zScoreDiff)) %>% 
+    mutate(Gene1=factor(Gene1)) 
+  
+  
+  ## Plot results:
+  dgca_plot <- ggplot(ddcor_res3, aes(x=Gene2, y=Gene1, fill=zScoreDiff)) + 
+    geom_tile() + 
+    scale_fill_distiller(palette="RdBu") + 
+    theme_minimal_grid() + theme_cust(box=F, lnsz=0, xtickangle=90) + 
+    labs(x="Hallmark Hypoxia or HIF signature gene", y="Hallmark or pan-cancer EMT gene",
+         fill="zScoreDiff\n(adj. p-value < 0.05)",
+         title=paste("DGCA: Poorly vs. Moderately differentiated",plt_title3))
+  print(dgca_plot)
+  
+  
+  mean_zscorediffs[i] <- mean(ddcor_res3$zScoreDiff)
+}
+
+mean_zscorediffs_df <- data.frame(type=factor(tumor_type, levels=tumor_type),
+                                  mean_zscorediff = mean_zscorediffs)
+
+ggplot(mean_zscorediffs_df, aes(x=type, y=mean_zscorediff)) +
+  geom_col(color="black", size=1) + 
+  scale_fill_manual(values=julia_cols) +
+  scale_y_continuous(expand=expansion(mult=c(0, 0.05))) +
+  theme_cowplot(18, line_size=1) + theme_cust(box=F, legend.position = "bottom") +
+  labs(x="Tumor differentiation scores used",
+       y="Mean z-score difference for\nEMT and hypoxia gene correlation", 
+       title="DGCA: Poorly vs. moderately differentiated") 
+ggsave("DGCA_mean-zscore-diffs_sig-only.png", height=5, width=7)
+
+  
+```
+
+
+
+# Analysis of stroma content and EMT status
+Now we turn to comparing the stroma esimates from Dr. Stelow to stromal/immune gene enrichment as calculated from GSVA.
+```{r Stelow stromal content estimates}
+## F0 stromal content correlation to RNA-seq EMT scores:
+stelow_emt %>% 
+  # # ggscatterstats(x=F0_pct_stroma, y=PCEMT_MESENCHYMAL,
+  # ggscatterstats(x=F0_pct_stroma, y=HALLMARK_EPITHELIAL_MESENCHYMAL_TRANSITION,
+  #                point.args = list(shape=16, alpha=1.0, size=2.3),
+  #                ggtheme = theme_cowplot(12, line_size=0.8),
+  #                )
+  ggplot(aes(F0_pct_stroma, PCEMT_MESENCHYMAL)) +
+  # ggplot(aes(F0_pct_stroma, HALLMARK_EPITHELIAL_MESENCHYMAL_TRANSITION)) +
+    geom_point(size=2.3) +
+    geom_smooth(method="lm") +
+    theme_cowplot() + theme_cust() + 
+    labs(title="F0 tumors", x="% stroma (Stelow)")
+ggsave("F0_stroma-EMTscore_comp_Stelow.png", width=5, height=4)
+
+## F0 differentiation-stromal content ANOVA:
+stelow_emt %>% 
+  ggbetweenstats(x=F0_differentiation, y=F0_pct_stroma,
+                 plot.type = "box",
+                 violin.args=list(size=1),
+                 point.args = list(alpha=0.7, shape=16, size=3,
+                                   position = jitter_pos),
+                 mean.ci = T, notch = F,
+                 # type ="np", 
+                 ggtheme = theme_cowplot(12, line_size=0.8),
+                 ggplot.component = list( # extra ggplot geoms
+                   geom_boxplot(fill=NA, size=1, alpha=0.3, width=0.3, outlier.alpha=0),
+                   # Label the tumors with associated PDX cell lines:
+                   geom_label_repel(aes(label=.$PDX_line, fill=.$PDX_line), min.segment.length = 0, size = 3, position=jitter_pos)
+                   ),
+                 ) +
+    # geom_label_repel(aes(label=clin_data$PDX_line)) + 
+    # geom_boxplot(fill=NA, size=1, alpha=0.3, width=0.3, outlier.alpha=0) +
+    scale_color_brewer(palette="Set1", direction=-1) +
+    scale_fill_brewer(palette="Dark2") +
+    #theme(axis.text.x = element_text(angle=60, hjust=1)) +
+    labs(x="F0 differentiation (Stelow)", y="F0 mean % stroma", title="Bauer Lab RNA-seq samples") + guides(color=F)
+ggsave("F0_differentiation-pctstroma_comp_Stelow.png", width=5, height=4)
+
+
+
+
+## PDX stromal content correlation to RNA-seq EMT GSVA scores:
+stelow_emt %>% 
+  # # ggscatterstats(x=PDX_pct_stroma, y=PCEMT_MESENCHYMAL,
+  # ggscatterstats(x=PDX_pct_stroma, y=HALLMARK_EPITHELIAL_MESENCHYMAL_TRANSITION,
+  #                point.args = list(shape=16, alpha=1.0, size=2.3),
+  #                ggtheme = theme_cowplot(12, line_size=0.8),
+  #                )
+  ggplot(aes(PDX_pct_stroma, PCEMT_MESENCHYMAL)) +
+  # ggplot(aes(PDX_pct_stroma, HALLMARK_EPITHELIAL_MESENCHYMAL_TRANSITION)) +
+    geom_point(size=2.3) +
+    geom_smooth(method="lm") +
+    theme_cowplot() + theme_cust() + 
+    labs(title="PDX tumors", x="% stroma (Stelow)")
+ggsave("PDX_stroma-EMTscore_comp_Stelow.png", width=5, height=4)
+
+## PDX tumor differentiation-stromal content ANOVA:
+stelow_emt %>% 
+  ggbetweenstats(x=PDX_differentiation, y=PDX_pct_stroma,
+                 plot.type = "box",
+                 violin.args=list(size=1),
+                 point.args = list(alpha=0.7, shape=16, size=3,
+                                   position = jitter_pos),
+                 mean.ci = T, notch = F,
+                 # type ="np", 
+                 ggtheme = theme_cowplot(12, line_size=0.8),
+                 ggplot.component = list( # extra ggplot geoms
+                   geom_boxplot(fill=NA, size=1, alpha=0.3, width=0.3, outlier.alpha=0),
+                   # Label the tumors with associated PDX cell lines:
+                   geom_label_repel(aes(label=.$PDX_line, fill=.$PDX_line), min.segment.length = 0, size = 3, position=jitter_pos)
+                   ),
+                 ) +
+    # geom_label_repel(aes(label=clin_data$PDX_line)) + 
+    # geom_boxplot(fill=NA, size=1, alpha=0.3, width=0.3, outlier.alpha=0) +
+    scale_color_brewer(palette="Set1", direction=-1) +
+    scale_fill_brewer(palette="Dark2") +
+    #theme(axis.text.x = element_text(angle=60, hjust=1)) +
+    labs(x="PDX differentiation (Stelow)", y="PDX mean % stroma", title="Bauer Lab RNA-seq samples") + guides(color=F)
+ggsave("PDX_differentiation-pctstroma_comp_Stelow.png", width=5, height=4)
+  
+```
+
+
+
+# Survival analysis
+```{r Load survival information}
+## Load packages:
+library(survival)
+library(survminer)
+
+## Load survival data:
+fn_surv <- "patient_survival.xlsx"
+surv_data <- read_excel(fn_surv, sheet="formatted_survival", na="NA")
+
+## Add survival data to annotations for the tumors with RNA-seq data:
+spls_surv <- spls %>% 
+  inner_join(surv_data, by="spl") %>% 
+  mutate(
+    OS = 1,
+    OS.time = surv_time_months,
+    DSS = 1, DSS = replace(DSS, is.na(cause_of_death), NA),
+    DSS.time = surv_time_months, DSS.time=replace(DSS.time, is.na(cause_of_death), NA),
+    ) %>% 
+  inner_join(spls2, by="spl", suffix=c("",".x")) %>%
+  mutate(
+    NMF = factor(NMF, levels=c("E+/M-","E+/M+","E-/M+")),
+    hallhyp = as.numeric(HALLMARK_HYPOXIA>median(HALLMARK_HYPOXIA))+1,
+    hallhyp = replace(hallhyp, hallhyp==2, "Hypoxia-high"), hallhyp = replace(hallhyp, hallhyp==1, "Hypoxia-low"),
+    pcemt_gsva = as.numeric(PCEMT_MESENCHYMAL>median(PCEMT_MESENCHYMAL))+1,
+    pcemt_hallhyp = as.numeric(HALLMARK_HYPOXIA>median(HALLMARK_HYPOXIA) & PCEMT_MESENCHYMAL>median(PCEMT_MESENCHYMAL))+1,
+    # pcemt_hallhyp = "",
+    # pcemt_hallhyp = replace(pcemt_hallhyp, HALLMARK_HYPOXIA>median(HALLMARK_HYPOXIA) & PCEMT_MESENCHYMAL>median(PCEMT_MESENCHYMAL), "EMT-H/Hyp-H"),
+    # pcemt_hallhyp = replace(pcemt_hallhyp, HALLMARK_HYPOXIA<median(HALLMARK_HYPOXIA) & PCEMT_MESENCHYMAL>median(PCEMT_MESENCHYMAL), "EMT-H/Hyp-L"),
+    # pcemt_hallhyp = replace(pcemt_hallhyp, HALLMARK_HYPOXIA>median(HALLMARK_HYPOXIA) & PCEMT_MESENCHYMAL<median(PCEMT_MESENCHYMAL), "EMT-L/Hyp-H"),
+    # pcemt_hallhyp = replace(pcemt_hallhyp, HALLMARK_HYPOXIA<median(HALLMARK_HYPOXIA) & PCEMT_MESENCHYMAL<median(PCEMT_MESENCHYMAL), "EMT-L/Hyp-L"),
+  )
+
+```
+
+```{r Survival analyses}
+plot_cis <- F
+surv_colors <- paletteer_d("RColorBrewer::Set1")[c(3,5,4)]
+surv_xbreaks <- 5
+## =============== OVERALL SURVIVAL (OS) ## ===============
+## Set up survival object:
+km1 <- Surv(time = spls_surv$OS.time, event = spls_surv$OS)
+
+## Fit Kaplan-Meier, stratifying by Hallmark Hypoxia status:
+km1_hallhyp <- survfit(km1 ~ hallhyp, data = spls_surv, type = "kaplan-meier", conf.type = "log")
+km1_hallhyp
+survdiff(km1~hallhyp, data = spls_surv) # Chi-squared test
+ggsurvplot(km1_hallhyp, conf.in=plot_cis, pval=T, pval.method=T, 
+           break.x.by=surv_xbreaks,
+           palette=surv_colors) +
+  labs(title="Overall survival (OS)", x="Days")
+# ggsave("KM_HallHyp_OS.png")
+# ggsave("KM_HallHyp_OS.pdf")
+
+## Fit Kaplan-Meier, stratifying by M-high/low status:
+km1_pcemt <- survfit(km1 ~ NMF, data = spls_surv, type = "kaplan-meier", conf.type = "log")
+km1_pcemt
+survdiff(km1~NMF, data = spls_surv) # Chi-squared test
+ggsurvplot(km1_pcemt, conf.in=plot_cis, pval=T, pval.method=T, 
+           break.x.by=surv_xbreaks,
+           palette=surv_colors) +
+  labs(title="Overall survival (OS)", x="Days")
+# ggsave("KM_pcEMT-NMF_OS.png")
+# ggsave("KM_pcEMT-NMF_OS.pdf")
+
+
+## =============== DISEASE-SPECIFIC SURVIVAL (DSS) =============== ##
+## Set up survival object:
+km2 <- Surv(time = spls_surv$DSS.time, event = spls_surv$DSS)
+
+## Fit Kaplan-Meier, stratifying by M-high/low status:
+km2_hallhyp <- survfit(km2 ~ hallhyp, data = spls_surv, type = "kaplan-meier", conf.type = "log")
+km2_hallhyp
+survdiff(km2~hallhyp, data = spls_surv) # Chi-squared test
+ggsurvplot(km2_hallhyp, conf.in=plot_cis, pval=T, pval.method=T, 
+           break.x.by=surv_xbreaks, palette=surv_colors) + 
+  labs(title="Disease-specific survival (DSS)", x="Days")
+# ggsave("KM_hallhyp_DSS.png")
+# ggsave("KM_hallhyp_DSS.pdf")
+
+## Fit Kaplan-Meier, stratifying by M-high/low status:
+km2_pcemt <- survfit(km2 ~ NMF, data = spls_surv, type = "kaplan-meier", conf.type = "log")
+km2_pcemt
+survdiff(km2~NMF, data = spls_surv) # Chi-squared test
+ggsurvplot(km2_pcemt, conf.in=plot_cis, pval=T, pval.method=T, 
+           break.x.by=surv_xbreaks, palette=surv_colors) + 
+  labs(title="Disease-specific survival (DSS)", x="Days")
+# ggsave("KM_pcEMT-NMF_DSS.png")
+# ggsave("KM_pcEMT-NMF_DSS.pdf")
+```
+
+
+
+# Analysis of BMI/obesity and tumor EMT status
+```{r Correlations and linear modeling of BMI-EMT status}
+## Get and organize data:
+bmi <- clin_data %>% 
+  dplyr::select(spl, BMI) %>% 
+  inner_join(stelow_emt, by="spl") %>% 
+  dplyr::select(-contains(all_of(c("PDX_","spl")))) 
+
+
+## Simple correlations:
+bmi %>% 
+  ggscatterstats(x=PCEMT_MESENCHYMAL, y=BMI)
+bmi %>% 
+  ggscatterstats(x=HALLMARK_EPITHELIAL_MESENCHYMAL_TRANSITION, y=BMI)
+
+
+## Linear regression (OLS):  
+library(gglm)
+lm_bmi <- lm(BMI ~ PCEMT_MESENCHYMAL, data=bmi) #%>% step(direction="both", trace=0)
+summary(lm_bmi)
+gglm(lm_bmi)
+ggcoefstats(lm_bmi, stats.labels=F, sort="ascending", 
+            title="Linear regression on patient BMI",
+            xlab="Regression coefficient", ylab="",
+            )
+
+lm_bmi <- lm(BMI ~ HALLMARK_EPITHELIAL_MESENCHYMAL_TRANSITION, data=bmi) #%>% step(direction="both", trace=0)
+summary(lm_bmi)
+gglm(lm_bmi)
+ggcoefstats(lm_bmi, stats.labels=F, sort="ascending", 
+            title="Linear regression on patient BMI",
+            xlab="Regression coefficient", ylab="",
+            )
+```
+
+```{r Differentiation-BMI correlations}
+bmi %>% 
+  ggbetweenstats(x=F0_differentiation, y=BMI,
+                 title="BMI-F0 differentiation correlation")
+```
+
+
+ 

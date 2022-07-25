@@ -1,0 +1,841 @@
+---
+title: "Analysis of scRNA-seq data from Elyada et al. Cancer Discovery August 2019 (PMID: 31197017): Mouse ductal cells"
+output: 
+  html_document: 
+    fig_height: 6
+    fig_width: 8
+    theme: spacelab
+    toc: yes
+Author: "Paul J. Myers"
+Date of creation: "1/26/2020"
+R version: "4.1.0"
+---
+
+# Housekeeping Code
+
+We start by loading some of the desired libraries for this script. Additional packages will be loaded later for specific analyses to make their use clear.
+
+```{r Load packages, message=F, warning=F}
+### Load packages:
+library(tidyverse)
+library(magrittr)
+library(BiocManager)
+library(paletteer)
+library(cowplot)
+library(ggrepel)
+library(ggbeeswarm)
+library(ggstatsplot)
+library(umap)
+library(ComplexHeatmap)
+library(tidyHeatmap)
+library(pheatmap)
+library(parallel)
+library(ConsensusClusterPlus)
+```
+
+```{r Clear workspace}
+### Clear R workspace:
+rm(list=ls())
+```
+
+```{r Check working directory}
+### Check that current working directory is correct and the desired one:
+cwd <- getwd()
+cwd
+setwd(cwd)
+```
+
+```{r Define "not in" operator}
+## Define 'not in' (ni) operator
+`%ni%` <- Negate(`%in%`)
+```
+
+The function below can be used to generate a ggplot with a blank grid and black box surrounding the plot area.
+
+```{r Custom ggplot theme for plot background}
+theme_cust <- function(ticks=T, axis="y", box=T, lnsz=1,
+                       xtickangle=0, hjust=NULL, vjust=NULL, fill=NA,
+                       legend.position="right"){
+  theme_out <- theme(legend.position=legend.position)
+  if (ticks == FALSE & axis == "y" ){
+    theme_out <- theme_out + theme(
+      axis.text.y = element_blank(), axis.ticks.y = element_blank(), # Make y axis ticks blank
+      axis.line.y = element_blank(),
+      axis.line.x = element_blank(),
+      panel.background = element_rect(size = lnsz, color = "black", fill = fill),
+      )
+  } else if (ticks == FALSE & axis != "y"){
+    theme_out <- theme_out + theme(
+      axis.text.x = element_blank(), axis.ticks.x = element_blank(), # Make x axis ticks blank
+      axis.line.y = element_blank(),
+      axis.line.x = element_blank(),
+      panel.background = element_rect(size = lnsz, color = "black", fill = fill),
+      )
+  } else {
+     theme_out <- theme_out + theme(
+       axis.line.y = element_blank(),
+       axis.line.x = element_blank(),
+       panel.background = element_rect(size = lnsz, color = "black", fill = fill),
+       axis.text.x = element_text(angle=xtickangle, hjust = hjust, vjust=vjust),
+       ) 
+  }
+  if (ticks== FALSE & axis=="both"){
+    theme_out <- theme_out + theme(
+      axis.ticks.y=element_blank(), axis.ticks.x=element_blank(),
+      axis.text.y=element_blank(), axis.text.x=element_blank()
+    )
+  }
+  if (xtickangle==90){
+    theme_out <- theme_out + theme(axis.text.x = element_text(angle=xtickangle, hjust = 1, vjust=0.4))
+  }
+  
+  if (box != TRUE) {
+    theme_out <- theme_out + theme(panel.background = element_blank(),
+                                   axis.line.y = element_line(size = lnsz, color = "black"),
+                                   axis.line.x = element_line(size = lnsz, color = "black")
+                                   )
+  } else {
+    theme_out <- theme_out
+  }
+  return(theme_out)
+}
+
+# Julia's Plots.jl default color order:
+julia_cols <- c("#009AFA","#E26E47","#3FA54E","#c270D2","#AD8F18","#01ABAE","#ED5F92","#C68324","#01A98C","#8F961E","#01A9CD","#9B7EE8","#618CF7","#F16072","#DC65B7","#6D9E33")
+```
+
+The function below capitalizes only the first letter of each word in a character or string.
+```{r capwords function}
+capwords <- function(s, strict = FALSE) {
+    cap <- function(s) paste(toupper(substring(s, 1, 1)),
+                  {s <- substring(s, 2); if(strict) tolower(s) else s},
+                             sep = "", collapse = " " )
+    sapply(strsplit(s, split = " "), cap, USE.NAMES = !is.null(names(s)))
+}
+```
+
+
+# Load and clean data
+
+For this particular analysis, we're interested in analyzing the ductal cells identified from mouse tumors as described in [Elyada et al. (Cancer Discovery, 2019).](https://doi.org/10.1158/2159-8290.CD-19-0094). From the mouse data, there are two main sets of ductal cells: (1) ductal cells identified in the all viable cell fraction and (2) EPCAM-negative ductal cells identified in the triple-negative (TN), fibroblast-enriched fraction. We will analyze both sets of ductal cells together, making sure to highlight their fraction of origin when appropriate.
+
+```{r Gene annotation data}
+## Ensembl ID-to-gene symbol annotations:
+fn.genes <- "../scRNAseq data/C_Mouse_fibroblast_files/fibroblast_matrix_files/genes.tsv"
+genes <- read_tsv(fn.genes, col_names = F) 
+colnames(genes) <- c("ensemblID","gene_symbol")
+# genes <- genes %>% mutate(gene_symbol= toupper(gene_symbol))
+
+
+## Load Entrez gene IDs that match ENSEMBL IDs:
+fn.entrez <- "ms_entrezIDs.csv"
+file.exists(fn.entrez)
+if(file.exists(fn.entrez)){
+  entrezIDs <- read.csv(fn.entrez)
+} 
+
+## Use biomaRt to get ENTREZ gene IDs if the file doesn't exist:
+if(!exists("entrezIDs")){
+  library(biomaRt)
+  mart <- useDataset("mmusculus_gene_ensembl", useMart("ensembl"))
+
+  entrezIDs <- getBM(
+    filters="ensembl_gene_id",
+    attributes=c("ensembl_gene_id", "entrezgene_id"),
+    values=genes$ensemblID,
+    mart=mart)
+  write.csv(entrezIDs,"ms_entrezIDs.csv", row.names = F)
+}
+```
+
+
+```{r Load the single-cell data}
+### File names/paths:
+## Gene expression files:
+fn.expr <- "../scRNAseq data/A_Mouse_DAPI_negative_files/DAPI_negative_expression.csv" # gene expression from the DAPI- fraction of cells
+fn.expr_tn <- "../scRNAseq data/B_Mouse_TN_files/TN_expression.csv" # gene expression from the TN fraction of cells
+
+## tSNE/annotation data:
+fn.anno <- "../scRNAseq data/A_Mouse_DAPI_negative_files/DAPI_negative_tsne_annotation.csv" # tSNE and annotaiton data for DAPI- fraction
+fn.anno_tn <- "../scRNAseq data/B_Mouse_TN_files/TN_tsne_annotation.csv" # tSNE and annotation data for TN fraction
+
+### Load gene expression for each cell fraction and pull out just the ductal cells: (note, this may take a minute or two to run)
+## DAPI- fraction:
+dapi.anno <- read_csv(fn.anno, col_names=T) %>% 
+  dplyr::rename(ID = 1) %>% 
+  subset(dbCluster==7) # 7 = ductal cells
+  # subset(dbCluster==7 | dbCluster = 12) # 12 = EMT-like cells
+
+dapi.expr <- data.table::fread(file=fn.expr) %>% 
+  dplyr::rename(geneID = V1) %>% 
+  dplyr::select(geneID, contains(all_of(dapi.anno$ID))) # select just the ductal cells
+colnames(dapi.expr) <- colnames(dapi.expr) %>% make.names()
+colnames(dapi.expr)[-1] <- paste(colnames(dapi.expr)[-1],".TN",sep="")
+
+
+## TN fraction:
+tn.anno <- read_csv(fn.anno_tn, col_names=T) %>% 
+  dplyr::rename(ID = 1) %>% 
+  subset(Cluster == 1 | Cluster == 2 | Cluster == 3 | Cluster == 4)
+tn.expr <- data.table::fread(file=fn.expr_tn) %>% 
+  dplyr::rename(geneID = V1) %>% 
+  dplyr::select(geneID, contains(all_of(tn.anno$ID))) # select just the ductal cells
+colnames(tn.expr) <- colnames(tn.expr) %>% make.names()
+colnames(tn.expr)[-1] <- paste(colnames(tn.expr)[-1],".TN",sep="")
+
+## Combine gene expression data for ductal cells from both fractions: 
+expr <- full_join(tn.expr, dapi.expr, by="geneID")
+expr[is.na(expr)] <- 0 # set missing expression values to 0
+expr <- expr %>% 
+  subset(geneID %ni% c("ENSGGENES","ENSGUMI")) # remove info about number of genes and UMIs
+
+## Sample (cell) names and annotation data:
+spls <- colnames(expr)[-1] %>%
+  data.frame(ID=.)
+```
+
+
+```{r Data with other gene ID types}
+## Expression data with Entrez gene IDs:
+expr.entrez <- expr %>% 
+  mutate(geneID = geneID %>% match(entrezIDs$ensembl_gene_id) %>% entrezIDs$entrezgene_id[.])
+
+## Expression data with gene symbols:
+expr.symbol <- expr %>% 
+  mutate(geneID = geneID %>% match(genes$ensemblID) %>% genes$gene_symbol[.])
+
+
+
+## Filter out zero-variance genes:
+# zeroVar <- which((expr[,-1] %>% apply(MARGIN=1, FUN=var, na.rm=TRUE)) == 0)
+# zeroVarGenes <- expr[zeroVar,] # genes with zero variance
+# expr.filt <- expr[-zeroVar, ] # expression data without zero-variance genes
+# # expr <- expr[-zeroVar, ] # expression data without zero-variance genes
+```
+
+# Gene signatures of interest
+Now we define gene signatures of interest from other articles in the literature.
+
+```{r HIF signature}
+hif.sig <- c("IGFBP3", "EDN2", "PFKFB4", "FLT1", "TFR2", "BNIP3L", "TGFA",
+             "BNIP3","PGK1","EGLN1","LDHA","EGLN3","CP","TGFB3","PFKFB3",
+             "HK1","TFRC","EDN1","CDKN1A","CA9","ADM","HMOX1","SERPINE1",
+             "LOX","NDRG1","CA12","PDK1","VEGFA","ERO1L","RORA","P4HA1","MXI1",
+             "SLC2A1","STC2","MIF","DDIT4","ENO1","CXCR4","PLOD1","P4HA2","GAPDH","PGAM1","TMEM45A","PIM1") %>%
+  capwords(strict=T) %>% # capitalize only first letter of gene names to match convention for mouse gene symbols
+  data.frame(symbol = .) %>% 
+  mutate(ensemblID = match(symbol, genes$gene_symbol) %>% genes$ensemblID[.])
+
+
+## HIF signature gene expression:
+hif <- match(hif.sig$ensemblID, expr$geneID) %>% na.omit() %>% expr[.,] %>% data.frame()
+rownames(hif) <- hif$geneID %>% match(genes$ensemblID) %>% genes$gene_symbol[.]
+
+```
+
+```{r pcEMT signature, message=F}
+## Load pan-cancer EMT signature:
+pcemt.fn <- "Pan-cancer-EMT-signature_Mak-et-al-2016.txt"
+pcemt.sig <- read_tsv(pcemt.fn, col_names = c("gene","type")) %>% 
+  mutate(gene = gene %>% capwords(strict=T))
+pcemt.sig.m <- pcemt.sig %>% subset(type %in% "Mesenchymal")
+
+## Get pcEMT signature expression data:
+pcemt <- pcemt.sig$gene %>%
+  match(expr.symbol$geneID) %>% na.omit() %>% 
+  expr.symbol[.,] %>% 
+  data.frame()
+rownames(pcemt) <- pcemt$geneID
+
+pcemt.t <- pcemt[,-1] %>% t() %>% 
+  data.frame() %>% 
+  mutate(ID = rownames(.))
+
+## Expression for the mesenchymal genes:
+pcemt_m <- pcemt %>%
+  subset(rownames(.) %in% pcemt.sig.m$gene) %>%
+  .[,-1] %>%
+  t() 
+
+## Expression for the epithelial genes:
+pcemt_e <- pcemt %>%
+  subset(rownames(.) %ni% pcemt.sig.m$gene) %>%
+  .[,-1] %>%
+  t() 
+
+```
+
+```{r Get KEGG signaling pathways}
+library(clusterProfiler)
+options(clusterProfiler.download.method = "wininet")
+
+# -- Download hsa KEGG DB:
+keggdb <- download_KEGG(species="mmu")
+
+# -- Get signaling pathway IDs:
+keggsig_pathways <- keggdb[["KEGGPATHID2NAME"]] %>% 
+  filter(str_detect(to,"signaling pathway")) %>% 
+  filter(!str_detect(to," - ")) %>% 
+  dplyr::rename(name=to)
+
+# -- Get genes for signaling pathways:
+keggsig_genes <- keggdb[["KEGGPATHID2EXTID"]] %>% 
+  filter(str_detect(from, paste(keggsig_pathways$from,collapse="|"))) %>% 
+  dplyr::rename(entrezID=to) %>% 
+  inner_join(keggsig_pathways, by="from") %>%
+  mutate(
+    ensemblID = match(entrezID, entrezIDs$entrezgene_id) %>% entrezIDs$ensembl_gene_id[.],
+    symbol = match(ensemblID, genes$ensemblID) %>% genes$gene_symbol[.],
+  )
+
+# -- Format signaling pathway gene lists for downstream analyses:
+keggsig <- keggsig_genes %>% 
+  split(x = .$ensemblID, f=.$name)
+  
+```
+
+
+```{r Load MSigDB collections, message=F, warning=F}
+## ## Load packages:
+# BiocManager::install(c(msigdbr","GSVA","limma"))
+library(msigdbr)
+
+### Define MSigDB gene set collection(s) to use --> retrieve with 'msigdbr' package:
+species = "Mus musculus"
+
+## Retrieve Hallmark and canonical pathways collections in the database:
+hall = msigdbr(species = species, category = "H")
+cp = msigdbr(species = species, category = "C2", subcategory = "CP")
+cp.b = msigdbr(species = species, category = "C2", subcategory = "CP:BIOCARTA")
+cp.r = msigdbr(species = species, category = "C2", subcategory = "CP:REACTOME")
+cp.p = msigdbr(species = species, category = "C2", subcategory = "CP:PID")
+cp.k = msigdbr(species = species, category = "C2", subcategory = "CP:KEGG")
+cp.w = msigdbr(species = species, category = "C2", subcategory = "CP:WIKIPATHWAYS")
+gene_sets1 <- rbind(hall, 
+                    cp,
+                    cp.b,
+                    cp.r,
+                    cp.p,
+                    cp.w,
+                    cp.k
+                    ) %>% 
+  # split(x = .$entrez_gene, f = .$gs_name)
+  split(x = .$ensembl_gene, f = .$gs_name)
+  # split(x = .$gene_symbol, f = .$gs_name)
+
+  
+## Go collections:
+go.bp <- msigdbr(species = species, category = "C5", subcategory = "GO:BP")
+go.cc <- msigdbr(species = species, category = "C5", subcategory = "GO:CC")
+go.mf <- msigdbr(species = species, category = "C5", subcategory = "GO:MF")
+gene_sets2 <- rbind(
+  go.cc,
+  go.mf,
+  go.bp
+  ) %>% 
+  # split(x = .$entrez_gene, f = .$gs_name)
+  split(x = .$ensembl_gene, f = .$gs_name)
+  # split(x = .$gene_symbol, f = .$gs_name)
+
+## Transcription factor target collections:
+tft <- msigdbr(species = species, category = "C3", subcategory = "TFT:GTRD")
+tft_leg <- msigdbr(species = species, category = "C3", subcategory = "TFT:TFT_Legacy")
+gene_sets3 <- rbind(tft, tft_leg) %>%
+  # split(x = .$entrez_gene, f = .$gs_name)
+  split(x = .$ensembl_gene, f = .$gs_name)
+  # split(x = .$gene_symbol, f = .$gs_name)
+
+## Pan-cancer EMT sub-signatures, G13 signature, and HIF signature:
+pcemt_e.sig <- pcemt.sig %>% subset(type=="Epithelial") %>% dplyr::pull(gene) %>%
+  match(genes$gene_symbol) %>% na.omit() %>% genes$ensemblID[.]
+pcemt_m.sig <- pcemt.sig %>% subset(type=="Mesenchymal") %>% dplyr::pull(gene) %>%
+  match(genes$gene_symbol) %>% na.omit() %>% genes$ensemblID[.]
+gene_sets4 <- list(
+  PCEMT_EPITHELIAL_GENES = pcemt_e.sig,
+  PCEMT_MESENCHYMAL_GENES = pcemt_m.sig,
+  HIF_SIGNATURE = hif.sig$ensemblID
+  )
+
+
+
+## Put all gene sets together for GSVA/PAS calculation:
+gene_sets_all <- gene_sets1 %>% 
+  append(gene_sets2) %>% # GO collections
+  append(keggsig) %>% 
+  # append(gene_sets3) %>% # TFT collections
+  append(gene_sets4) # pcEMT, HIF sig
+
+```
+
+
+# Gene set enrichment/pathway activity analysis
+Here we calculate pathway activity/gene set enrichment scores (PASs/GSESs) using `Pagoda2` (Pagoda2 scores). The function we'll use to perform this calculation is adapted from the original function that can be found in the [GitHub repository](https://github.com/sulab-wmu/PASBench/blob/master/R/tools.R) associated with [Zhang et al. (Computational and Structural Biotechnology Journal, 2020)](https://www.sciencedirect.com/science/article/pii/S2001037020304293#b0095).
+```{r Pagoda2 function}
+# BiocManager::install("scde") # required for pathway overdispersion analysis with `pagoda2`
+library(pagoda2)
+
+## Function for calculating pagoda2 pathway activity scores (modified from PASBench paper by Zhang et al.):
+cal_pagoda2 = function(counts,
+                       gSets,
+                       nPcs=20,
+                       trim=5,
+                       n_cores=1,
+                       modelType="raw" # options: "raw", "plain", and "linearObs"
+                       ){
+  set.seed(123)
+  tryCatch({
+    p2 = Pagoda2$new(counts, trim =trim, n.cores=n_cores, log.scale=F, modelType=modelType)
+
+    p2$adjustVariance(plot=F)
+
+    p2$calculatePcaReduction(nPcs = nPcs, use.odgenes=F, fastpath=T)
+
+    ## Define custom gene sets for use with Pagoda2:
+    path_names = c()
+    env = new.env(parent=globalenv())
+    invisible(lapply(1:length(gSets),function(i) {
+      genes = intersect(gSets[[i]],rownames(counts))
+      # name = paste0(names(gSets[i]),i)
+      name = names(gSets[i])
+      if(length(genes)>1){
+        assign(name, genes, envir = env)
+        path_names = c(path_names, name)
+      }
+    }))
+
+    ## Pathway overdispersion analysis:
+    p2$testPathwayOverdispersion(setenv = env, verbose = T,
+                                 recalculate.pca = F,
+                                 n.randomizations = 50,
+                                 min.pathway.size = 1,
+                                 )
+
+    ## Extract Pagoda2 pathway activation scores:
+    path_names = names(p2$misc$pwpca)
+    score = matrix(NA,nrow=length(path_names),ncol=ncol(counts))
+    rownames(score) = path_names
+    colnames(score) = colnames(counts)
+    for(i in 1:length(p2$misc$pwpca)){
+      if(!is.null(p2$misc$pwpca[[i]]$xp$score)){
+        score[i,] = p2$misc$pwpca[[i]]$xp$scores
+      }
+    }
+    return(score)
+  },error = function(e){
+    print(e)
+    return("error")
+  })
+}
+```
+
+```{r Pagoda2 calculations, message=F, warning=F}
+## mRNA expression data to use for Pagoda2 calculations:
+data_for_p2 <- expr %>% dplyr::select(-geneID) %>% data.matrix()
+rownames(data_for_p2) <- expr$geneID
+
+
+## =============== Calculation of pathway activity/gene set enrichment scores using pagoda2 =============== ##
+## Gene sets to use:
+p2_genesets <- gene_sets_all %>%
+  subset(str_detect(names(.),"HALLMARK_HYPOXIA|HALLMARK_EPITHEL|signaling pathway")) %>%
+  subset(str_detect(names(.),"HALLMARK_|signaling pathway")) %>%
+  append(gene_sets4) %>%
+  append(gene_sets2 %>% subset(str_detect(names(.),"GOBP_P38|GOBP_ERK|GOBP_JNK|GOCC_PROTEIN_PHOSPHATASE")))
+
+## Pagoda2 calculation:
+p2_res <- cal_pagoda2(data_for_p2, p2_genesets, nPcs=20, trim=0, modelType="raw")
+p2_res_df <- p2_res %>%  # store Pagoda2 results in dataframe
+  na.omit() %>% # remove gene sets that are not over-dispersed (did not get a Pagoda2 score)
+  t() %>% 
+  data.frame(ID=rownames(.))
+
+
+## Visualize Pagoda2 score distributions:
+p2_res_df %>%
+  pivot_longer(-ID) %>%
+  ggplot(aes(x=value, after_stat(density))) +
+    # geom_histogram() +
+    geom_histogram(fill="dodgerblue") +
+    facet_wrap(~name, scales="free")
+
+gsets_to_viz <- c("HALLMARK_EPITHELIAL_MESENCHYMAL_TRANSITION","PCEMT_MESENCHYMAL_GENES","HALLMARK_HYPOXIA",
+                  "PCEMT_EPITHELIAL_GENES")
+p2_res_df %>% 
+  pivot_longer(-ID) %>% 
+  filter(str_detect(name,paste(gsets_to_viz,collapse="|"))) %>% 
+  ggplot(aes(x=value, after_stat(density))) +
+    geom_histogram(bins=100, fill="dodgerblue") +
+    facet_wrap(~name, scales="free")
+```
+
+
+# pcEMT UMAP embeddings
+Now we calculate UMAP embeddings of the pcEMT signature, overlay PASs on the embeddings, and then afterwards perform consensus clustering on the embedding.
+```{r UMAP embeddings}
+#################### Full pcEMT signature #################### 
+## Perform UMAP embedding:
+embedding2 <- umap::umap(pcemt[,-1] %>% t(), 
+                        n_neighbors = 30, min_dist = 0.01,
+                        n_components = 2,
+                        verbose=T,
+                        random_state=123
+                        )
+
+#################### Mesenchymal portion of pcEMT signature #################### 
+## Perform UMAP embedding:
+embedding3 <- umap::umap(pcemt_m, 
+                        n_neighbors = 30, min_dist = 0.01,
+                        n_components = 2,
+                        verbose=T,
+                        random_state=123
+                        )
+
+```
+
+```{r PASs overlaid on UMAP embeddings}
+#################### Full signature #################### 
+## Plot UMAP embedding:
+pltdata1 <- embedding2$layout %>%
+  data.frame() %>%
+  mutate(ID = rownames(.)) %>%
+  full_join(pcemt.t, by="ID") %>% 
+  full_join(p2_res_df, by="ID")
+
+ggplot(pltdata1, aes(X1,X2, label = ID, 
+                     color = PCEMT_MESENCHYMAL_GENES)) +
+                     # color = HALLMARK_EPITHELIAL_MESENCHYMAL_TRANSITION)) + 
+    geom_point() + 
+    scale_color_viridis_c(option="plasma") +
+    theme_cowplot(8, rel_small=1, rel_large=1, line_size=0.5) + theme_cust(ticks=F,axis="both",box=T) +
+    labs(title="Mouse ductal cells: Full pcEMT signature", x = "UMAP1", y = "UMAP2")
+
+
+#################### Mesenchymal portion of signature #################### 
+## Plot UMAP embedding:
+pltdata2 <- embedding3$layout %>%
+  data.frame() %>%
+  mutate(ID = rownames(.)) %>%
+  full_join(p2_res_df, by="ID")
+
+ggplot(pltdata2,
+       aes(X1,X2, label = ID, color = PCEMT_MESENCHYMAL_GENES)) +
+       # aes(X1,X2, label = ID, color = HALLMARK_EPITHELIAL_MESENCHYMAL_TRANSITION)) + 
+    geom_point() + 
+    scale_color_viridis_c(option="plasma") +
+    # scale_color_gradientn(colors = colorRampPalette(paletteer_d("RColorBrewer::YlGnBu",direction = -1))(100)) +
+    theme_cowplot(8, rel_small=1, rel_large=1, line_size=0.5) + theme_cust(ticks=F,axis="both",box=T) + 
+    # guides(color="none") +
+    labs(title="Mouse ductal cells: pcEMT-M signature", x = "UMAP1", y = "UMAP2")
+
+ggplot(pltdata2,
+       aes(X1,X2, label = ID, color = HIF_SIGNATURE)) +
+       # aes(X1,X2, label = ID, color = HALLMARK_HYPOXIA)) + 
+    geom_point() + 
+    scale_color_viridis_c(option="plasma") +
+    # scale_color_gradientn(colors = colorRampPalette(paletteer_d("RColorBrewer::YlGnBu",direction = -1))(100)) +
+    theme_cowplot(8, rel_small=1, rel_large=1, line_size=0.5) + theme_cust(ticks=F,axis="both",box=T) + 
+    # guides(color="none") +
+    labs(title="Mouse ductal cells: pcEMT-M signature", x = "UMAP1", y = "UMAP2")
+```
+
+# Hypoxia enrichment correlations and modeling
+Now we attempt to use predictive machine learning models to identify which gene sets are most predictive of hypoxia gene set enrichment in the ductal cells.
+```{r LASSO & linear model analysis, message=F, warning=F}
+library(glmnet)
+library(gglm)
+
+## =============== glmnet models (LASSO, ridge, elastic net) =============== ##
+## Get data:
+model_data <- p2_res_df
+X <- model_data %>% 
+  dplyr::select(ends_with(".signaling.pathway")) %>%
+  data.matrix()
+
+y <- model_data %>% pull(HALLMARK_HYPOXIA)
+
+## Train and tune LASSO model:
+cvfit <- cv.glmnet(X, y, alpha=1)  # tune model --> alpha=1, LASSO; alpha=0, ridge regression
+r2 <- cvfit$glmnet.fit$dev.ratio[which(cvfit$glmnet.fit$lambda == cvfit$lambda.1se)]  # get R2 value
+print(paste("R2_lasso=",round(r2, digits=3),sep=""))  # print R2 value for glmnet model
+plot(cvfit) # plot CV results
+coefs <- coef(cvfit, s="lambda.1se") %>% # get coefficients
+  as.numeric() %>% 
+  .[-1] %>% 
+  data.frame(coef=., gene_set=colnames(X)) %>% 
+  filter(coef!=0) %>% 
+  arrange(coef) %>% 
+  mutate(gene_set=factor(gene_set, levels=gene_set))
+
+ggplot(coefs, aes(x=coef, y=gene_set)) +
+  geom_col(color="black", fill=julia_cols[1], size=0.8) +
+  theme_minimal_grid() + 
+  labs(title="glmnet model: LASSO")
+
+
+## =============== OLS for coefficient statistics and further variable selection =============== ##
+## Fit OLS model and perform variable selection (using AIC):
+lm_data <- model_data %>% 
+  dplyr::select(HALLMARK_HYPOXIA, coefs$gene_set)
+lm_genesets <- colnames(lm_data)
+lm_data <- lm_data %>% 
+  rename_with(~gsub(".signaling.pathway","",.x)) %>%
+  rename_with(~gsub("_SIGNALING_PATHWAY","",.x)) %>%
+  rename_with(~gsub("KEGG_","",.x))
+ols <- lm(HALLMARK_HYPOXIA ~ . + 1, data=lm_data) %>% 
+  step(direction="both", trace=F)
+summary(ols)
+r2_ols <- summary(ols)$r.squared %>% round(3)
+adjr2_ols <- summary(ols)$adj.r.squared %>% round(3)
+gglm(ols) # diagnostic plots
+
+
+## Model coefficients:
+ggcoefstats(ols,
+            stats.labels=F, exclude.intercept = T, sort="ascending",
+            point.args = list(size=3, color="dodgerblue"),
+            ggtheme=theme_cowplot(8, rel_small=1, rel_large=1, line_size=0.5),
+            caption = paste("Adj. R-squared =",round(r2_ols,3))
+            ) + 
+  theme_cust() +
+  labs(x = "Regression coefficient", y = "KEGG signaling pathway",
+       title="Linear regression on mouse ductal cell\nHallmark Hypoxia Pagoda2 scores")
+ggsave("Plots/ms-duct_KEGG-signaling-pathways_ols-coefstats.png", height=4, width=5)
+ggsave("Plots/ms-duct_KEGG-signaling-pathways_ols-coefstats.pdf", height=4, width=5)
+
+
+## Model predictions/performance (parity plot):
+yhat <- ols$fitted.values
+ys <- data.frame(y, yhat)
+ggscatterstats(ys, x=y, y=yhat,
+               type="np", marginal=F,
+               smooth.line.args = list(method="lm", size=1.5, color=julia_cols[1]),
+               point.args = list(size=2.5, alpha=0.5, shape=16),
+               ggtheme=theme_cowplot(8, rel_small=1, rel_large=1, line_size=0.5),
+               ) +
+  theme_cust() +
+  annotate("label", x=min(y)*0.7,y=max(yhat), label=paste("Adj.R^2==",adjr2_ols),parse=T) +
+  labs(x="Actual Hallmark Hypoxia Pagoda2 score", y="Predicted Hallmark Hypoxia Pagoda2 score",
+       title="Parity plot: OLS, mouse ductal cells")
+ggsave("Plots/ms-duct_KEGG-signaling-pathways_ols-parityplot.png", height=4, width=4)
+ggsave("Plots/ms-duct_KEGG-signaling-pathways_ols-parityplot.pdf", height=4, width=4)
+
+```
+
+Checking the gene overlap of these gene sets.
+```{r Gene overlap of model gene sets}
+library(ComplexHeatmap)
+gs4upset <- gene_sets_all %>% subset(names(.) %in% lm_genesets)
+names(gs4upset) <- gsub("_SIGNALING_PATHWAY","",names(gs4upset))
+names(gs4upset) <- gsub(".signaling.pathway","",names(gs4upset))
+names(gs4upset) <- gsub("KEGG_","",names(gs4upset))
+
+comb_mat <- make_comb_mat(gs4upset) 
+
+UpSet(comb_mat, column_title="Number of distinct overlapping genes")
+```
+
+
+# ConsensusClusterPlus (CCP)
+Now we want to perform consensus clustering with the ConsensusClusterPlus package (available through BioConductor) to identify different groups of ductal cells based on the pcEMT signature.
+```{r CCP calculations}
+##################### pcEMT mesenchymal genes: UMAP embedding #####################
+## Data to cluster (cells/samples as columns) on UMAP embedding of pcEMT-M subsignature gene expression:
+ccpdata1 <- embedding3$layout %>% t() # UMAP embedding of cells using the pcEMT-M subsignature
+
+## Load CCP results, if they've been saved previously:
+fn_ccp <- "ms_duct_ccp_results.Rdata"
+if(file.exists(fn_ccp) & !exists("results1")){ 
+  results1 <- load(fn_ccp)
+}
+
+force_calculate_ccp <- F # choose whether to force CCP calculations
+if(!exists("results1") | force_calculate_ccp){
+  ## Run (CCP) consensus clustering:
+  results1 <- ConsensusClusterPlus(ccpdata1,
+                                   seed = 123, distance="euclidean",
+                                   innerLinkage = "ward.D2", finalLinkage = "ward.D2",
+                                   pItem=0.8, pFeature = 1, maxK = 9, verbose=T,
+                                   clusterAlg = "pam"
+                                   )
+  icl1 <- calcICL(results1) # get cluster assignments for all numbers of k
+  
+  save_ccp <- c("results1","icl1")
+  
+  ## Save the results for speed:
+  save(save_ccp, file=fn_ccp)
+}
+
+```
+
+```{r Annotate cells with CCP clusters, warning=F, message=F}
+## Merge consensus clustering results with enrichment scores, gene set scores, expression data, etc.:
+num_k = 4 # how many clusters to ask from consensus clustering
+
+ccp.pltdata_gsva <- icl1[["itemConsensus"]] %>% 
+  filter(k==num_k) %>%
+  group_by(item) %>% filter(itemConsensus == max(itemConsensus)) %>% 
+  dplyr::select(item, cluster) %>% 
+  dplyr::rename(ID = item) %>% 
+  full_join(pltdata2, by="ID")
+
+if(num_k==4){
+  ccp.pltdata_gsva <- ccp.pltdata_gsva %>%
+    mutate(
+      cluster=replace(cluster, cluster==1, "M-high 3"),
+      cluster=replace(cluster, cluster==3, "M-high 2"),
+      cluster=replace(cluster, cluster==4, "M-high 1"),
+      cluster=replace(cluster, cluster==2, "M-low"),
+      )
+  ccp.pltdata_gsva <- ccp.pltdata_gsva %>% 
+    mutate(cluster=factor(cluster, levels=c("M-high 1","M-high 2","M-high 3","M-low"))) %>% 
+    arrange(cluster)
+} else {
+  ccp.pltdata_gsva <- ccp.pltdata_gsva %>%
+    mutate(cluster=factor(cluster, levels=seq(1:num_k) %>% as.character()))
+}
+
+ccp_savedata <- ccp.pltdata_gsva %>%
+  dplyr::select(ID, cluster, X1, X2, contains(all_of("PCEMT_"))) %>% 
+  dplyr::rename(UMAP1=X1, UMAP2=X2)
+write.csv(ccp_savedata, file="ms-duct_pcEMT_annot.csv", row.names=F)
+```
+
+
+```{r Overlay consensus clusters on UMAP embeddings}
+## ================ Plot UMAP embedding from pcEMT-M genes ================ ##
+heatmap_cols1 <- paletteer_d("RColorBrewer::Set1")[c(3:5,9)]
+heatmap_cols2 <- paletteer_d("RColorBrewer::Set1")
+
+ccp.pltdata_gsva %>% 
+  ggplot(aes(X1,X2, label = cluster, color = cluster)) + 
+      geom_point(alpha=1) + 
+      scale_color_manual(values=heatmap_cols1[c(1,3,4,2)]) +
+      theme_cowplot(8, rel_small=1, rel_large=1, line_size=0.5) + theme_cust(ticks=F,axis="both",box=T) + 
+      theme(legend.position = c(.95, .95), legend.justification = c("right", "top")) +
+      labs(title="Mouse ductal cells: pcEMT-M signature", x = "UMAP1", y = "UMAP2") 
+ggsave("Plots/ms-duct_pcEMT-M_UMAP_+_CCP-clusters.png", width = 3.4, height = 3.2)
+ggsave("Plots/ms-duct_pcEMT-M_UMAP_+_CCP-clusters.pdf", width = 3.4, height = 3.2)
+
+## ================ Heatmap of pcEMT signature with consensus cluster annotations ================ ##
+h <- 6
+w <- 15
+## Get data for heatmap:
+pcemt_df <- pcemt_phm <- pcemt[,-1] %>%
+  t() %>% 
+  data.frame(ID=rownames(.)) %>% 
+  pivot_longer(-ID, names_to = "gene", values_to = "Normalized UMIs") %>% 
+  inner_join(pcemt.sig, by="gene") %>% 
+  mutate(type = replace(type, type=="M","Mesenchymal"),
+         type = replace(type, type=="E","Epithelial")) %>% 
+  inner_join(ccp.pltdata_gsva[,c("ID","cluster")], by="ID") %>% 
+  dplyr::rename(pcEMT_sig=type, 
+                pcEMT_cc=cluster)
+
+
+## Heatmap of full pcEMT signature with consensus cluster annotations:
+n_cols <- 100 # number of colors for heatmap cells
+colors1 <- paletteer_d("RColorBrewer::RdBu", 100, direction=-1, type="continuous")
+
+pcemt_hm <- pcemt_df %>% 
+  group_by(pcEMT_sig, pcEMT_cc) %>% 
+  heatmap(ID, gene, `Normalized UMIs`,
+          show_column_dend=F, show_row_dend=F, show_row_names=F, .scale="none",
+          cluster_columns=T, clustering_distance_columns="canberra", clustering_method_columns="ward.D2",
+          cluster_rows=T, clustering_distance_rows="euclidean", clustering_method_rows="ward.D2",
+          palette_value=circlize::colorRamp2(seq(min(.$`Normalized UMIs`), max(.$`Normalized UMIs`),length.out=n_cols),
+                                               # viridis::inferno(n_cols)),
+                                               colors1),
+          palette_grouping=list(heatmap_cols1[c(1,3,4,2)], heatmap_cols2[2:1]),
+          column_title="Mouse ductal cells: pcEMT signature", 
+          row_title=NULL,
+          column_title_gp=gpar(fontsize=8),
+          column_names_gp=gpar(fontsize=8),
+          use_raster=T,
+          ) 
+pcemt_hm
+pcemt_hm %>% save_pdf("ms-duct_pcEMT-heatmap_+_CCP-clusters.pdf", height=h, width=w)
+png("ms-duct_pcEMT-heatmap_+_CCP-clusters.png", height=h, width=w, units="in", res=500); pcemt_hm; dev.off()
+
+```
+
+# Compare Hallmark Hypoxia and HIF signature scores/enrichment between CCP groups
+```{r Pagoda2 score comparisons, warning=F, message=F}
+plt_ht <- 4.5
+plt_width <- 5.2
+line_size <- 0.8
+bplotw <- 0.15
+viow <- 0.75
+
+points_args <- list(alpha=0.4, shape=16, position = position_quasirandom(width = 0.15))
+centrality.label_args <- list(size=2, direction="x")
+centrality.point_args <- list(size=0)
+ggsignif_args <- list(textsize=2.3, size=0.3, tip_length=0.015)
+rcbcols1 <- heatmap_cols1
+rcbcols2 <- heatmap_cols1[c(1,3,4,2)]
+ordered_cols <- rcbcols1[c(4,1,3,2)]
+
+## =============== HIF signature =============== ##
+ccp.pltdata_gsva %>% 
+  mutate(cluster=factor(cluster, levels=c("M-low","M-high 3","M-high 2","M-high 1"))) %>% 
+ggbetweenstats(x=cluster, y=HIF_SIGNATURE,
+               plot.type = "box", type="np", p.adjust.method="BH",
+               point.args = points_args, ggsignif.args = ggsignif_args, 
+               ggplot.component = geom_boxplot(size=line_size, alpha=0, width=0.3),
+               centrality.label.args = centrality.label_args,
+               centrality.point.args = centrality.point_args,
+               mean.ci=F, notch=F, bf.message = F, centrality.plotting = F,
+               ) +
+  scale_color_manual(values = ordered_cols) +
+  theme_cowplot(line_size = line_size) + guides(color="none") + 
+  labs(x="Consensus cluster", y="HIF signature Pagoda2 score", title="Mouse ductal cells")
+ggsave("HIF_PAS_comparisons__ms-duct.png", width = plt_width, height = plt_ht)
+ggsave("HIF_PAS_comparisons__ms-duct.pdf", width = plt_width, height = plt_ht)
+
+ccp.pltdata_gsva %>% 
+  ggplot(aes(x=cluster, y=HIF_SIGNATURE, color=cluster, fill=cluster)) +
+    geom_violin(width=viow, color="black") + geom_boxplot(color="black", fill="white", outlier.shape=NA, width=bplotw) +
+    scale_color_manual(values=rcbcols2) +
+    scale_fill_manual(values=rcbcols2) +
+    theme_cowplot(8, rel_small=1, rel_large=1, line_size=line_size) +
+    guides(color="none") + 
+    labs(x="Consensus cluster", y="HIF signature Pagoda2 score", title="Mouse ductal cells")
+ggsave("Plots/ms-duct_Mlow-vs-Mhigh_HIF-sig_violin.pdf", width = w*0.8, height = h)
+ggsave("Plots/ms-duct_Mlow-vs-Mhigh_HIF-sig_violin.png", width = w*0.8, height = h)
+
+
+## =============== Hallmark Hypoxia =============== ##
+ccp.pltdata_gsva %>% 
+  mutate(cluster=factor(cluster, levels=c("M-low","M-high 3","M-high 2","M-high 1"))) %>% 
+ggbetweenstats(x=cluster, y=HALLMARK_HYPOXIA,
+               plot.type = "box", type="np", p.adjust.method="BH",
+               point.args = points_args, ggsignif.args = ggsignif_args,
+               ggplot.component = geom_boxplot(size=line_size, alpha=0, width=0.3),
+               centrality.label.args = centrality.label_args,
+               centrality.point.args = centrality.point_args,
+               mean.ci=F, notch=F, bf.message = F, centrality.plotting = T,
+               ggstatsplot.layer = F,
+               ) +
+  scale_color_manual(values = ordered_cols) +
+  theme_cowplot(line_size = line_size) + guides(color="none") + 
+  labs(x="Consensus cluster", y="Hallmark Hypoxia Pagoda2 score", title="Mouse ductal cells")
+ggsave("Hypoxia_PAS_comparisons__ms-duct.png", width = plt_width, height = plt_ht)
+ggsave("Hypoxia_PAS_comparisons__ms-duct.pdf", width = plt_width, height = plt_ht)
+
+ccp.pltdata_gsva %>% 
+  ggplot(aes(x=cluster, y=HALLMARK_HYPOXIA, color=cluster, fill=cluster)) +
+    geom_violin(width=viow, color="black") + geom_boxplot(color="black", fill="white", outlier.shape=NA, width=bplotw) +
+    scale_color_manual(values=rcbcols2) +
+    scale_fill_manual(values=rcbcols2) +
+    theme_cowplot(8, rel_small=1, rel_large=1, line_size=line_size) +
+    guides(color="none") + 
+    labs(x="Consensus cluster", y="Hallmark Hypoxia Pagoda2 score", title="Mouse ductal cells")
+ggsave("Plots/ms-duct_Mlow-vs-Mhigh_Hallmark-Hypoxia_violin.png", width = w*0.8, height = h)
+ggsave("Plots/ms-duct_Mlow-vs-Mhigh_Hallmark-Hypoxia_violin.pdf", width = w*0.8, height = h)
+```
+
+
+```{r Print session info}
+sink("ms-duct_sessionInfo.txt")
+sessionInfo()
+sink()
+```

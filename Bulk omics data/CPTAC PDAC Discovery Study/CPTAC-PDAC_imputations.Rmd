@@ -1,0 +1,55 @@
+---
+title: "Imputation of CPTAC PDAC global proteomics data"
+author: Paul J. Myers
+output:
+  html_document:
+    fig_width: 9
+    fig_height: 6
+    theme: spacelab
+    toc: yes
+  pdf_document: 
+    toc: yes
+    fig_width: 9
+    fig_height: 6
+R version: "4.1.2"
+---
+
+# Imputation of CPTAC PDAC global proteomics data
+This notebook is for imputing missing data in the CPTAC PDAC global proteomics data set using the DreamAI algorithm (https://github.com/WangLab-MSSM/DreamAI) designed specifically for the CPTAC to impute data in proteomics data sets.
+```{r Load packages}
+## Load required packages for DreamAI:
+require("cluster")
+require("survival")
+require("randomForest")
+require("missForest")
+require("glmnet")
+require("Rcpp")
+require("foreach")
+require("itertools")
+require("iterators")
+require("Matrix")
+require("devtools")
+require("impute")
+
+
+## Load packages and data to impute:
+library(DreamAI)
+library(magrittr)
+```
+
+
+```{r Load and preprocess CPTAC data}
+## Load CPTAC PDAC global proteomics data set:
+fn <- "CPTAC PDAC data/PDAC_LinkedOmics_Data/proteomics_gene_level_MD_abundance_tumor.cct"
+raw.data <- read.table(fn)
+
+## Remove proteins with <50% of entries:
+data_50 <- raw.data[rowSums(is.na(raw.data))<(ncol(raw.data)/2),]
+```
+
+
+```{r Perform DreamAI imputation}
+imputed <- DreamAI(data_50) # impute CPTAC PDAC data
+write.csv(imputed$Ensemble, file="CPTAC PDAC data/imputed_proteomics_gene_level_MD_abundance_tumor.csv")
+```
+
