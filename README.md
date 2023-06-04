@@ -3,7 +3,7 @@
 This repository contains the code needed to reproduce the following figures from the paper Brown et al., "A histone methylation-MAPK signaling axis drives durable epithelial-mesenchymal transition in hypoxic pancreas cancer" (Pre-print on bioRxiv: https://doi.org/10.1101/2022.10.19.512869):
 * **Figure 1**
 * **Figure 4A-B**
-* **Supplementary Figures S1-S4 and S10**
+* **Supplementary Figures S1, S2, S3, S4, and S10**
 * **Supplementary Figure S5C**
 * **Supplementary Figure S9A**
 * **Supplementary Figure S13B**
