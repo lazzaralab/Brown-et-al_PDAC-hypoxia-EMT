@@ -11,7 +11,7 @@ This repository contains the code needed to reproduce the following figures from
 ## Requirements and running code
 Codes were written using R 4.1.2 but _should_ run without issues using R ≥ 3.6, but we do not make any guarantees here. Codes are provided as R notebooks, which can be run out-of-the-box using RStudio. R can be downloaded [here](https://cran.rstudio.com/), and RStudio can be downloaded [here](https://posit.co/download/rstudio-desktop/).
 
-Package versions used to run each analysis can be found in the `sessionInfo.txt` file(s) present in the directory for each data set (e.g., `Bulk omics analyses/CPTAC PDAC Discovery Study/sessionInfo_CPTAC_proteomics-phosphoproteomics.txt`).
+If you encounter issues running analyses with newly installed packages, the package versions originally used to run each analysis can be found in the `sessionInfo.txt` file(s) present in the directory for each data set (e.g., `Bulk omics analyses/CPTAC PDAC Discovery Study/sessionInfo_CPTAC_proteomics-phosphoproteomics.txt`).
 
 ## Data availability
 ### CPTAC PDAC Discovery Study
