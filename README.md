@@ -33,7 +33,9 @@ CPTAC data should be placed in the directory `Bulk omics analyses/CPTAC PDAC Dis
 
 TCGA data should be placed in the directory `Bulk omics analyses/TCGA analysis/TCGA PAAD data`. A zipped folder with the data, `TCGA PAAD data.zip`, is provided in the directory `Bulk omics analyses/TCGA analysis`.
 
-The scRNA-seq data should be placed in the directory `Elyada et al scRNA-seq/scRNAseq data`
+The scRNA-seq data should be placed in the directory `Elyada et al scRNA-seq/scRNAseq data`.
+
+PDX RNA-seq data should be placed in the directory `Bulk omics analyses/PDX RNA-seq`.
 
 ### CPTAC PDAC Discovery Study
 There are three notebooks for running analyses on the CPTAC PDAC data. These notebooks are located under `Bulk omics analyses/CPTAC PDAC Discovery Study`:
