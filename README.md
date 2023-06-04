@@ -29,7 +29,7 @@ PDAC patient-derived xenograft (PDX) tumor RNA-seq data are available for downlo
 
 ## Running code
 ### Data placement
-CPTAC data should be placed in the directory `Bulk omics analyses/CPTAC PDAC Discovery Study/CPTAC PDAC data`. A zipped folder with the data, `CPTAC PDAC data.zip`, is provided under `Bulk omics analyses/CPTAC PDAC Discovery Study`.
+CPTAC data should be placed in the directory `Bulk omics analyses/CPTAC PDAC Discovery Study/CPTAC PDAC data`. A zipped folder with the data, `CPTAC PDAC data.zip`, is provided in the directory `Bulk omics analyses/CPTAC PDAC Discovery Study`.
 
 TCGA data should be placed in the directory `Bulk omics analyses/TCGA analysis/TCGA PAAD data`. A zipped folder with the data, `TCGA PAAD data.zip`, is provided in the directory `Bulk omics analyses/TCGA analysis`.
 
