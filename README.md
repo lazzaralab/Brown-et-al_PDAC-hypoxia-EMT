@@ -39,20 +39,24 @@ PDX RNA-seq data should be placed in the directory `Bulk omics analyses/PDX RNA-
 
 ### CPTAC PDAC Discovery Study
 There are three notebooks for running analyses on the CPTAC PDAC data. These notebooks are located under `Bulk omics analyses/CPTAC PDAC Discovery Study`:
-1. `CPTAC-PDAC_analysis_final.Rmd`
-2. `CPTAC-PDAC_analysis_RNAseq_final.Rmd`
-3. `CPTAC-PDAC_imputations.Rmd`
+1. `CPTAC-PDAC_analysis_final.Rmd`: Generates the results found in **Figure 1A-D**, **Figure 4A**, and **Supplementary Figure S2**.
+2. `CPTAC-PDAC_analysis_RNAseq_final.Rmd`: Repeats most of the calculations in `CPTAC-PDAC_analysis_final.Rmd` using CPTAC PDAC transcriptomic (RNA-seq) data.
+3. `CPTAC-PDAC_imputations.Rmd`: Generates the imputed version of the proteomics data that is needed to run parts of `CPTAC-PDAC_analysis_final.Rmd`, particularly the code that is needed to generate the heatmap found in **Figure 1A**.
 
 ### TCGA PAAD study
 There is one notebook for running analyses on the TCGA PAAD data. This notebook is located under `Bulk omics analyses/TCGA analysis`:
-1. `TCGA_PAAD_analysis_final_PDAC.Rmd`
+1. `TCGA_PAAD_analysis_final_PDAC.Rmd`: Generates the results found in **Supplementary Figure S3**.
 
 ### Elyada et al. scRNA-seq
 There are two notebooks for running analyses on the Elyada et al. scRNA-seq data. These notebooks are located under `Elyada et al scRNA-seq/Code and analyses`:
-1. `hs-duct_analysis.Rmd`
-2. `ms-duct_analysis.Rmd`
+1. `hs-duct_analysis.Rmd`: Generates the results found in **Figure 1E-G**, **Figure 4B**, and **Supplementary Figure S10**.
+2. `ms-duct_analysis.Rmd`: Generates the results found in **Supplementary Figure S4** and **Supplementary Figure S8A**. 
 
 
 ### PDX RNA-seq
 There is one notebook for running analyses on the PDX tumor data. This notebook is located under `Bulk omics analyses/PDX RNA-seq`:
-1. `PDX_RNAseq_analysis.Rmd`
+1. `PDX_RNAseq_analysis.Rmd`: Generates the results found in **Supplementary Figure S5C**.
+
+### Gene set comparisons
+There is one notebook for running comparisons of the genes making up several gene sets of interest in this publication. This notebook is located under `Gene signature comparisons`:
+1. `Gene_signature_overlap_comparisons.Rmd`: Generates the results found in **Supplementary Figure S1.**
