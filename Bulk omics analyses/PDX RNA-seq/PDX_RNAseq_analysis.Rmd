@@ -29,12 +29,7 @@ library(ggrepel)
 library(ggbeeswarm)
 library(ggstatsplot)
 library(Hmisc)
-library(pcaMethods)
-library(pheatmap)
-library(ComplexHeatmap)
-library(tidyHeatmap)
 library(parallel)
-library(M3C)
 library(org.Hs.eg.db)
 ```
 
